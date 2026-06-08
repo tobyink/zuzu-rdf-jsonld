@@ -1,0 +1,133 @@
+from test/more import *;
+
+from rdf import
+	NQuadsParser,
+	RDF_NS,
+	RdfParser,
+	RdfSerializer,
+	rdf_datasets_isomorphic,
+	rdf_iri,
+	rdf_literal,
+	rdf_quads_minus,
+	rdf_quad;
+from rdf/parser/jsonld import JsonLdParser;
+from rdf/parser/yamlld import YamlLdParser;
+from rdf/parser/cborld import CborLdParser;
+from rdf/serializer/jsonld import JsonLdSerializer;
+from rdf/serializer/yamlld import YamlLdSerializer;
+from rdf/serializer/cborld import CborLdSerializer;
+from std/data/cbor import CBOR;
+from std/data/json import JSON;
+
+class FakeStore {
+	let Array quads with get := [];
+
+	method add_quads ( Array new_quads ) {
+		for ( let quad in new_quads ) {
+			quads.push(quad);
+		}
+		return self;
+	}
+}
+
+let parser := new JsonLdParser();
+ok( parser does RdfParser, "JsonLdParser composes RdfParser" );
+
+let quads := parser.parse_string("""
+{
+  "@context": {
+    "ex": "http://example.com/",
+    "name": "ex:name",
+    "knows": {"@id": "ex:knows", "@type": "@id"}
+  },
+  "@id": "ex:alice",
+  "@type": "ex:Person",
+  "name": {"@value": "Alice", "@language": "en"},
+  "knows": "bob",
+  "ex:age": 42,
+  "ex:list": {"@list": ["a", "b"]}
+}
+""", base: "http://example.com/");
+
+let expected := ( new NQuadsParser() ).parse_string("""
+<http://example.com/alice> <http://www.w3.org/1999/02/22-rdf-syntax-ns#type> <http://example.com/Person> .
+<http://example.com/alice> <http://example.com/name> "Alice"@en .
+<http://example.com/alice> <http://example.com/knows> <http://example.com/bob> .
+<http://example.com/alice> <http://example.com/age> "42"^^<http://www.w3.org/2001/XMLSchema#integer> .
+""");
+
+ok(
+	rdf_quads_minus( expected, quads ).length() == 0,
+	"JSON-LD parses context, type, language, @id coercion, and native numbers",
+);
+is( quads.length(), 9, "JSON-LD expands RDF lists" );
+
+let store := new FakeStore();
+is( parser.parse_string( "{\"@id\":\"http://example.com/s\"}", into: store ), store, "into store returns store" );
+is( store.get_quads().length(), 0, "empty node adds no statements to store" );
+
+let named := parser.parse_string("""
+{
+  "@context": {"ex": "http://example.com/"},
+  "@id": "ex:g",
+  "@graph": {
+    "@id": "ex:s",
+    "ex:p": "named"
+  }
+}
+""", base: "http://example.com/");
+
+is( named.length(), 1, "JSON-LD parses named graph blocks" );
+is( named[0].get_graph().get_value(), "http://example.com/g", "named graph IRI is used" );
+
+let yaml_quads := ( new YamlLdParser() ).parse_string("""
+"@context":
+  ex: http://example.com/
+"@id": ex:s
+"ex:p": yaml
+""", base: "http://example.com/");
+is( yaml_quads.length(), 1, "YAML-LD parser decodes YAML surface syntax" );
+
+let cbor_data := ( new CBOR() ).encode({
+	"@context": { ex: "http://example.com/" },
+	"@id": "ex:s",
+	"ex:p": "cbor",
+});
+let cbor_quads := ( new CborLdParser() ).parse_binary(cbor_data, base: "http://example.com/");
+is( cbor_quads.length(), 1, "CBOR-LD parser decodes CBOR surface syntax" );
+
+let serializer := new JsonLdSerializer(canonical: true);
+ok( serializer does RdfSerializer, "JsonLdSerializer composes RdfSerializer" );
+let json_text := serializer.serialize([
+	rdf_quad(
+		rdf_iri("http://example.com/s"),
+		rdf_iri("http://example.com/p"),
+		rdf_literal("value"),
+	),
+]);
+like( json_text, /http:\/\/example\.com\/p/, "JSON-LD serializer emits predicate IRI" );
+ok(
+	rdf_datasets_isomorphic( parser.parse_string(json_text), [
+		rdf_quad(
+			rdf_iri("http://example.com/s"),
+			rdf_iri("http://example.com/p"),
+			rdf_literal("value"),
+		),
+	] ),
+	"JSON-LD serializer output parses back to equivalent RDF",
+);
+
+let yaml_text := ( new YamlLdSerializer() ).serialize(cbor_quads);
+like( yaml_text, /http:\/\/example\.com\/p/, "YAML-LD serializer emits YAML text" );
+
+let cbor_serialized := ( new CborLdSerializer() ).serialize(cbor_quads);
+ok( cbor_serialized instanceof BinaryString, "CBOR-LD serializer emits binary CBOR" );
+ok(
+	rdf_datasets_isomorphic(
+		( new CborLdParser() ).parse_binary(cbor_serialized),
+		cbor_quads,
+	),
+	"CBOR-LD serializer output parses back to equivalent RDF",
+);
+
+done_testing();

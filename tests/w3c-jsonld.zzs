@@ -1,0 +1,110 @@
+from test/more import *;
+
+author_testing();
+requires_capability( "fs" );
+
+from rdf import NQuadsParser, rdf_datasets_isomorphic;
+from rdf/parser/jsonld import JsonLdParser;
+from rdf/serializer/jsonld import JsonLdSerializer;
+from rdf/jsonld/core import jsonld_object_equals;
+from std/data/json import JSON;
+from std/io import Path;
+
+let root := new Path("tests/w3c/json-ld-api");
+let to_rdf_manifest := root.child("toRdf-manifest.jsonld");
+let from_rdf_manifest := root.child("fromRdf-manifest.jsonld");
+
+if ( not to_rdf_manifest.exists() or not from_rdf_manifest.exists() ) {
+	pass("W3C JSON-LD manifests not vendored");
+	done_testing();
+}
+
+let supported_to_rdf := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0004",
+	"#t0005",
+	"#t0006",
+	"#t0007",
+	"#t0008",
+	"#t0012",
+	"#t0013",
+	"#t0014",
+	"#t0015",
+	"#t0016",
+];
+
+let supported_from_rdf := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0017",
+];
+
+let json := new JSON();
+let jsonld_parser := new JsonLdParser();
+let nq_parser := new NQuadsParser();
+let serializer := new JsonLdSerializer(canonical: true);
+
+function _manifest ( path ) {
+	return json.load(path);
+}
+
+function _option_dict ( raw ) {
+	let out := {};
+	if ( raw instanceof Dict ) {
+		out.set( "use_native_types", raw.get("useNativeTypes") )
+			if raw.exists("useNativeTypes");
+		out.set( "use_rdf_type", raw.get("useRdfType") )
+			if raw.exists("useRdfType");
+		out.set( "rdf_direction", raw.get("rdfDirection") )
+			if raw.exists("rdfDirection");
+	}
+	return out;
+}
+
+let to_manifest := _manifest(to_rdf_manifest);
+let to_count := 0;
+let to_seen := 0;
+for ( let c in to_manifest{sequence} ) {
+	to_seen++ if c{"@id"} in supported_to_rdf;
+	next unless c{"@id"} in supported_to_rdf;
+	to_count++;
+	let input := "" _ c{input};
+	let actual := jsonld_parser.parse_file(
+		root.child(input),
+		base: to_manifest{baseIri} _ input,
+	);
+	let expected := nq_parser.parse_file(root.child("" _ c{expect}));
+	ok(
+		rdf_datasets_isomorphic( actual, expected ),
+		"W3C JSON-LD ToRDF " _ c{"@id"},
+	);
+}
+is( to_seen, supported_to_rdf.length(), "supported W3C ToRDF cases discovered" );
+ok( to_count > 0, "W3C ToRDF cases executed" );
+
+let from_manifest := _manifest(from_rdf_manifest);
+let from_count := 0;
+let from_seen := 0;
+for ( let c in from_manifest{sequence} ) {
+	from_seen++ if c{"@id"} in supported_from_rdf;
+	next unless c{"@id"} in supported_from_rdf;
+	from_count++;
+	let quads := nq_parser.parse_file(root.child("" _ c{input}));
+	let actual := json.decode(serializer.serialize(quads));
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD FromRDF " _ c{"@id"},
+	);
+}
+is(
+	from_seen,
+	supported_from_rdf.length(),
+	"supported W3C FromRDF cases discovered",
+);
+ok( from_count > 0, "W3C FromRDF cases executed" );
+
+done_testing();

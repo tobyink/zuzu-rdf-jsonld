@@ -1,0 +1,38 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/parser/cborld - CBOR-LD parser.
+
+=cut
+
+from rdf/parser import RdfParser;
+from rdf/jsonld/core import jsonld_to_rdf;
+from std/data/cbor import CBOR;
+
+class CborLdParser with RdfParser {
+	method parse_binary ( BinaryString data, ... PairList options ) {
+		return jsonld_to_rdf( ( new CBOR() ).decode(data), ...options );
+	}
+
+	method parse_string ( String text, ... PairList options ) {
+		return self.parse_binary( to_binary(text), ...options );
+	}
+
+	method parse_file ( path, ... PairList options ) {
+		return self.parse_binary( path.slurp(), ...options );
+	}
+
+	method parse_chunks ( Array chunks, ... PairList options ) {
+		let data := ~to_binary("");
+		for ( let chunk in chunks ) {
+			if ( chunk instanceof BinaryString ) {
+				data _= chunk;
+			}
+			else {
+				data _= to_binary("" _ chunk);
+			}
+		}
+		return self.parse_binary( data, ...options );
+	}
+}

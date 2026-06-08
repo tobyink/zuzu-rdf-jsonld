@@ -1,0 +1,34 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/serializer/jsonld - JSON-LD serializer.
+
+=cut
+
+from rdf/serializer import RdfSerializer;
+from rdf/jsonld/core import rdf_to_jsonld_data;
+from std/data/json import JSON;
+
+class JsonLdSerializer with RdfSerializer {
+	let Boolean pretty with get := false;
+	let Boolean canonical with get := true;
+	let Boolean ordered with get := true;
+	let Boolean use_native_types with get := false;
+	let Boolean use_rdf_type with get := false;
+	let rdf_direction with get := null;
+
+	method _data ( Array quads ) {
+		return rdf_to_jsonld_data(quads, {
+			use_native_types: use_native_types,
+			use_rdf_type: use_rdf_type,
+			rdf_direction: rdf_direction,
+		});
+	}
+
+	method serialize ( Array quads ) {
+		return ( new JSON( pretty: pretty, canonical: canonical ) ).encode(
+			self._data(quads),
+		);
+	}
+}

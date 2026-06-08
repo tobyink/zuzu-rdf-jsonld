@@ -1,0 +1,36 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/serializer/cborld - CBOR-LD serializer.
+
+=cut
+
+from rdf/serializer import RdfSerializer;
+from rdf/jsonld/core import rdf_to_jsonld_data;
+from std/data/cbor import CBOR;
+
+class CborLdSerializer with RdfSerializer {
+	let Boolean ordered with get := true;
+	let Boolean use_native_types with get := false;
+	let Boolean use_rdf_type with get := false;
+	let rdf_direction with get := null;
+
+	method _data ( Array quads ) {
+		return rdf_to_jsonld_data(quads, {
+			use_native_types: use_native_types,
+			use_rdf_type: use_rdf_type,
+			rdf_direction: rdf_direction,
+		});
+	}
+
+	method serialize ( Array quads ) {
+		return ( new CBOR() ).encode(self._data(quads));
+	}
+
+	method serialize_each ( Array quads, Function emit ) {
+		let data := self.serialize(quads);
+		emit(data) if data.length() > 0;
+		return self;
+	}
+}

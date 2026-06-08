@@ -1,0 +1,651 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/jsonld/core - shared JSON-LD RDF conversion helpers.
+
+=head1 DESCRIPTION
+
+Internal helpers for JSON-LD 1.1 ToRDF and FromRDF support used by the
+JSON-LD, YAML-LD, and CBOR-LD parser and serializer classes.
+
+=cut
+
+from rdf/parser/common import RDFReader, _parser_result;
+from rdf/term import
+	RDFBlank,
+	RDFDefaultGraph,
+	RDFIRI,
+	RDFLiteral,
+	RDF_NS,
+	XSD_NS,
+	rdf_blank,
+	rdf_default_graph,
+	rdf_iri,
+	rdf_literal,
+	rdf_quad,
+	rdf_term_key;
+from rdf/graph import rdf_quads_unique;
+from std/string import contains, index, join, replace, split, starts_with, substr;
+
+const JSONLD_NS := "http://www.w3.org/ns/json-ld#";
+
+function _jld_expand_iri;
+function _jld_object_term;
+function _jld_rdf_list;
+function _jld_node;
+function _jsonld_canonical;
+
+function _jld_has ( obj, String key ) {
+	return obj.exists(key) if obj instanceof Dict;
+	return obj.has(key) if obj instanceof PairList;
+	return false;
+}
+
+function _jld_get ( obj, String key, fallback := null ) {
+	return obj.get(key) if obj instanceof Dict and obj.exists(key);
+	return obj.get(key) if obj instanceof PairList and obj.has(key);
+	return fallback;
+}
+
+function _jld_set ( Dict obj, String key, value ) {
+	obj.set( key, value );
+	return obj;
+}
+
+function _jld_dict_has ( Dict obj, String key ) {
+	return obj.exists(key);
+}
+
+function _jld_dict_get ( Dict obj, String key ) {
+	return obj.get(key);
+}
+
+function _jld_dict_set ( Dict obj, String key, value ) {
+	obj.set( key, value );
+	return obj;
+}
+
+function _jld_keys ( obj ) {
+	return obj.keys() if obj instanceof Dict;
+	if ( obj instanceof PairList ) {
+		let seen := {};
+		let out := [];
+		for ( let pair in obj.to_Array() ) {
+			next if seen.exists(pair.key);
+			seen.set( pair.key, true );
+			out.push(pair.key);
+		}
+		return out;
+	}
+	return [];
+}
+
+function _jld_array ( value ) {
+	return value if value instanceof Array;
+	return [ value ];
+}
+
+function _jld_is_map ( value ) {
+	return value instanceof Dict or value instanceof PairList;
+}
+
+function _jld_abs_iri ( String value ) {
+	return true if value ~ /^[A-Za-z][A-Za-z0-9+.-]*:/;
+	return false;
+}
+
+function _jld_resolve ( String value, String base ) {
+	return value if value eq "" and base eq "";
+	return value if _jld_abs_iri(value) or starts_with( value, "_:" );
+	return ( new RDFReader(source: "") ).set_base(base).resolve_iri(value);
+}
+
+function _jld_context () {
+	return {
+		base: "",
+		vocab: "",
+		language: "",
+		terms: {},
+		aliases: {},
+	};
+}
+
+function _jld_context_clone ( Dict ctx ) {
+	let next_ctx := {
+		base: ctx{base},
+		vocab: ctx{vocab},
+		language: ctx{language},
+		terms: {},
+		aliases: {},
+	};
+	let ctx_terms := ctx{terms};
+	let next_terms := next_ctx{terms};
+	for ( let key in ctx_terms.keys() ) {
+		let term := ctx_terms.get(key);
+		next_terms.set( key, {
+			id: term.get("id"),
+			"type": term.get("type"),
+			container: term.get("container"),
+			language: term.get("language"),
+		});
+	}
+	let ctx_aliases := ctx{aliases};
+	let next_aliases := next_ctx{aliases};
+	for ( let key in ctx_aliases.keys() ) {
+		next_aliases.set( key, ctx_aliases.get(key) );
+	}
+	return next_ctx;
+}
+
+function _jld_keyword ( Dict ctx, String key ) {
+	return key if starts_with( key, "@" );
+	let aliases := ctx{aliases};
+	return aliases.get(key) if aliases.exists(key);
+	return key;
+}
+
+function _jld_term_id_from_value ( String term, value, Dict ctx ) {
+	if ( value == null ) {
+		return "";
+	}
+	if ( typeof value == "String" ) {
+		return value;
+	}
+	if ( _jld_is_map(value) ) {
+		let raw := _jld_get( value, "@id", null );
+		return raw if raw != null;
+	}
+	return term;
+}
+
+function _jld_term_type_from_value ( value, Dict ctx ) {
+	return null unless _jld_is_map(value);
+	let raw := _jld_get( value, "@type", null );
+	return raw if raw == null or starts_with( "" _ raw, "@" );
+	return _jld_expand_iri( "" _ raw, ctx, true, true );
+}
+
+function _jld_term_container_from_value ( value ) {
+	return null unless _jld_is_map(value);
+	let raw := _jld_get( value, "@container", null );
+	return raw == null ? null : "" _ raw;
+}
+
+function _jld_apply_context_item ( Dict ctx, item ) {
+	if ( item == null ) {
+		return _jld_context();
+	}
+	if ( typeof item == "String" ) {
+		die "jsonld: remote contexts are not supported";
+	}
+	if ( item instanceof Array ) {
+		let working := ctx;
+		for ( let part in item ) {
+			working := _jld_apply_context_item( working, part );
+		}
+		return working;
+	}
+	die "jsonld: context must be an object, array, string, or null"
+		unless _jld_is_map(item);
+	for ( let key in _jld_keys(item) ) {
+		let value := _jld_get( item, key );
+		if ( key eq "@base" ) {
+			ctx{base} := value == null ? "" : _jld_resolve( "" _ value, ctx{base} );
+		}
+		else if ( key eq "@vocab" ) {
+			ctx{vocab} := value == null ? "" : _jld_resolve( "" _ value, ctx{base} );
+		}
+		else if ( key eq "@language" ) {
+			ctx{language} := value == null ? "" : lc("" _ value);
+		}
+		else if ( starts_with( key, "@" ) ) {
+			next;
+		}
+		else if ( value == null ) {
+			let terms := ctx{terms};
+			terms.delete(key) if terms.exists(key);
+		}
+		else {
+			let id := _jld_term_id_from_value( key, value, ctx );
+			let expanded := id;
+			if ( starts_with( id, "@" ) ) {
+				let aliases := ctx{aliases};
+				aliases.set( key, id );
+			}
+			else {
+				expanded := _jld_expand_iri( id, ctx, true, true );
+			}
+			let terms := ctx{terms};
+			terms.set( key, {
+				id: expanded,
+				"type": _jld_term_type_from_value( value, ctx ),
+				container: _jld_term_container_from_value(value),
+				language: _jld_is_map(value) ?
+					_jld_get( value, "@language", ctx{language} ) :
+					ctx{language},
+			});
+		}
+	}
+	return ctx;
+}
+
+function _jld_apply_context ( Dict ctx, value ) {
+	return _jld_apply_context_item( _jld_context_clone(ctx), value );
+}
+
+function _jld_expand_iri (
+	String value,
+	Dict ctx,
+	Boolean vocab,
+	Boolean document_relative
+) {
+	let keyword := _jld_keyword( ctx, value );
+	return keyword if starts_with( keyword, "@" );
+	return value if starts_with( value, "_:" );
+	if ( contains( value, ":" ) ) {
+		let parts := split( value, ":", 2 );
+		let terms := ctx{terms};
+		if ( terms.exists(parts[0]) ) {
+			let prefix_term := terms.get(parts[0]);
+			let prefix := prefix_term.get("id");
+			return prefix _ parts[1] unless starts_with( prefix, "@" );
+		}
+		return value if _jld_abs_iri(value);
+	}
+	let terms := ctx{terms};
+	if ( vocab and terms.exists(value) ) {
+		let term := terms.get(value);
+		return term.get("id");
+	}
+	if ( vocab and ctx{vocab} ne "" ) {
+		return ctx{vocab} _ value;
+	}
+	return _jld_resolve( value, ctx{base} ) if document_relative;
+	return value;
+}
+
+function _jld_state () {
+	return { quads: [], bnodes: {}, count: 0 };
+}
+
+function _jld_bnode ( Dict state, String label := "" ) {
+	if ( label ne "" ) {
+		let clean_label := starts_with( label, "_:" ) ? substr( label, 2 ) : label;
+		let bnodes := state{bnodes};
+		if ( not bnodes.exists(clean_label) ) {
+			bnodes.set( clean_label, rdf_blank(clean_label) );
+		}
+		return bnodes.get(clean_label);
+	}
+	state{count}++;
+	return rdf_blank( "jld" _ state{count} );
+}
+
+function _jld_node_term ( String id, Dict state, Dict ctx ) {
+	if ( starts_with( id, "_:" ) ) {
+		return _jld_bnode( state, id );
+	}
+	return rdf_iri(_jld_resolve( id, ctx{base} ));
+}
+
+function _jld_add ( Dict state, subject, predicate, object, graph ) {
+	let quads := state{quads};
+	quads.push(rdf_quad(
+		subject,
+		predicate,
+		object,
+		graph == null ? rdf_default_graph() : graph,
+	));
+}
+
+function _jld_native_literal ( value ) {
+	if ( typeof value == "Boolean" ) {
+		return rdf_literal( value ? "true" : "false", "", rdf_iri(XSD_NS _ "boolean") );
+	}
+	if ( typeof value == "Number" ) {
+		if ( int(value) == value ) {
+			return rdf_literal( "" _ int(value), "", rdf_iri(XSD_NS _ "integer") );
+		}
+		return rdf_literal( "" _ value, "", rdf_iri(XSD_NS _ "double") );
+	}
+	return rdf_literal("" _ value);
+}
+
+function _jld_value_object ( value, Dict ctx, termdef ) {
+	let lang := _jld_get( value, "@language", "" );
+	let datatype := _jld_get( value, "@type", null );
+	let raw := _jld_get( value, "@value", "" );
+	if ( datatype != null ) {
+		datatype := _jld_expand_iri( "" _ datatype, ctx, true, true );
+		return rdf_literal( raw, "", rdf_iri(datatype) );
+	}
+	if ( lang ne "" ) {
+		return rdf_literal( raw, "" _ lang );
+	}
+	if ( termdef != null and termdef.get("language") != null and
+		termdef.get("language") ne "" ) {
+		return rdf_literal( raw, "" _ termdef.get("language") );
+	}
+	return _jld_native_literal(raw);
+}
+
+function _jld_object_term ( value, Dict ctx, Dict state, graph, termdef ) {
+	if ( _jld_is_map(value) ) {
+		let local_ctx := ctx;
+		if ( _jld_has( value, "@context" ) ) {
+			local_ctx := _jld_apply_context( ctx, _jld_get( value, "@context" ) );
+		}
+		if ( _jld_has( value, "@value" ) ) {
+			return _jld_value_object( value, local_ctx, termdef );
+		}
+		if ( _jld_has( value, "@list" ) ) {
+			return _jld_rdf_list(
+				_jld_get( value, "@list" ),
+				local_ctx,
+				state,
+				graph,
+				termdef,
+			);
+		}
+		if ( _jld_has( value, "@id" ) and _jld_keys(value).length() <= 2 ) {
+			return _jld_node_term(
+				_jld_expand_iri( "" _ _jld_get( value, "@id" ), local_ctx, false, true ),
+				state,
+				local_ctx,
+			);
+		}
+		return _jld_node( value, local_ctx, state, graph );
+	}
+	if ( termdef != null and termdef.get("type") eq "@id" ) {
+		return _jld_node_term(
+			_jld_expand_iri( "" _ value, ctx, false, true ),
+			state,
+			ctx,
+		);
+	}
+	if ( termdef != null and termdef.get("type") eq "@vocab" ) {
+		return _jld_node_term(
+			_jld_expand_iri( "" _ value, ctx, true, true ),
+			state,
+			ctx,
+		);
+	}
+	return _jld_native_literal(value);
+}
+
+function _jld_rdf_list ( value, Dict ctx, Dict state, graph, termdef ) {
+	let items := value instanceof Array ? value : [ value ];
+	return rdf_iri(RDF_NS _ "nil") if items.length() == 0;
+	let head := _jld_bnode(state);
+	let current := head;
+	let i := 0;
+	while ( i < items.length() ) {
+		let next_cell := i + 1 == items.length() ?
+			rdf_iri(RDF_NS _ "nil") :
+			_jld_bnode(state);
+		_jld_add(
+			state,
+			current,
+			rdf_iri(RDF_NS _ "first"),
+			_jld_object_term( items[i], ctx, state, graph, termdef ),
+			graph,
+		);
+		_jld_add( state, current, rdf_iri(RDF_NS _ "rest"), next_cell, graph );
+		current := next_cell;
+		i++;
+	}
+	return head;
+}
+
+function _jld_node_id ( value, Dict ctx, Dict state ) {
+	if ( _jld_has( value, "@id" ) ) {
+		return _jld_node_term(
+			_jld_expand_iri( "" _ _jld_get( value, "@id" ), ctx, false, true ),
+			state,
+			ctx,
+		);
+	}
+	return _jld_bnode(state);
+}
+
+function _jld_add_values (
+	Dict state,
+	subject,
+	String predicate_iri,
+	value,
+	Dict ctx,
+	graph,
+	termdef
+) {
+	let predicate := rdf_iri(predicate_iri);
+	for ( let item in _jld_array(value) ) {
+		let object := _jld_object_term( item, ctx, state, graph, termdef );
+		_jld_add( state, subject, predicate, object, graph );
+	}
+}
+
+function _jld_process_reverse ( Dict state, subject, reverse, Dict ctx, graph ) {
+	return null unless _jld_is_map(reverse);
+	for ( let key in _jld_keys(reverse) ) {
+		let terms := ctx{terms};
+		let termdef := terms.exists(key) ? terms.get(key) : null;
+		let predicate_iri := _jld_expand_iri( key, ctx, true, false );
+		for ( let item in _jld_array(_jld_get( reverse, key )) ) {
+			let object := _jld_object_term( item, ctx, state, graph, termdef );
+			_jld_add( state, object, rdf_iri(predicate_iri), subject, graph );
+		}
+	}
+	return null;
+}
+
+function _jld_node ( value, Dict ctx, Dict state, graph ) {
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			_jld_node( item, ctx, state, graph );
+		}
+		return null;
+	}
+	return null unless _jld_is_map(value);
+	let active_ctx := ctx;
+	if ( _jld_has( value, "@context" ) ) {
+		active_ctx := _jld_apply_context( ctx, _jld_get( value, "@context" ) );
+	}
+	let subject := _jld_node_id( value, active_ctx, state );
+	if ( _jld_has( value, "@graph" ) ) {
+		let graph_term := _jld_has( value, "@id" ) ? subject : graph;
+		_jld_node( _jld_get( value, "@graph" ), active_ctx, state, graph_term );
+	}
+	if ( _jld_has( value, "@type" ) ) {
+		for ( let type_value in _jld_array(_jld_get( value, "@type" )) ) {
+			let iri := _jld_expand_iri( "" _ type_value, active_ctx, true, true );
+			_jld_add( state, subject, rdf_iri(RDF_NS _ "type"), rdf_iri(iri), graph );
+		}
+	}
+	if ( _jld_has( value, "@reverse" ) ) {
+		_jld_process_reverse(
+			state,
+			subject,
+			_jld_get( value, "@reverse" ),
+			active_ctx,
+			graph,
+		);
+	}
+	for ( let key in _jld_keys(value) ) {
+		let keyword := _jld_keyword( active_ctx, key );
+		next if starts_with( keyword, "@" );
+		let terms := active_ctx{terms};
+		let termdef := terms.exists(key) ? terms.get(key) : null;
+		let predicate_iri := _jld_expand_iri( key, active_ctx, true, false );
+		next if starts_with( predicate_iri, "@" ) or predicate_iri eq "";
+		_jld_add_values(
+			state,
+			subject,
+			predicate_iri,
+			_jld_get( value, key ),
+			active_ctx,
+			graph,
+			termdef,
+		);
+	}
+	return subject;
+}
+
+function _jsonld_options ( PairList options ) {
+	let out := {
+		base: "",
+		into: null,
+		document_loader: null,
+		expand_context: null,
+		processing_mode: "json-ld-1.1",
+		produce_generalized_rdf: false,
+		rdf_direction: null,
+		use_jcs: false,
+	};
+	for ( let pair in options.to_Array() ) {
+		if ( out.exists(pair.key) ) {
+			out.set( pair.key, pair.value );
+		}
+		else {
+			die "jsonld parser: unsupported option '" _ pair.key _ "'";
+		}
+	}
+	return out;
+}
+
+function jsonld_to_rdf ( data, ... PairList options ) {
+	let opts := _jsonld_options(options);
+	let ctx := _jld_context();
+	ctx{base} := "" _ opts{base};
+	if ( opts{expand_context} != null ) {
+		let expanded_ctx := _jld_apply_context( ctx, opts{expand_context} );
+		ctx := expanded_ctx;
+	}
+	let state := _jld_state();
+	_jld_node( data, ctx, state, rdf_default_graph() );
+	return _parser_result( rdf_quads_unique(state{quads}), options );
+}
+
+function _fromrdf_term_id ( term ) {
+	return "_:" _ term.get_value() if term instanceof RDFBlank;
+	return term.get_value() if term instanceof RDFIRI;
+	return "";
+}
+
+function _fromrdf_value ( RDFLiteral term, Dict opts ) {
+	let obj := { "@value": term.get_value() };
+	if ( term.get_lang() ne "" ) {
+		obj.set( "@language", term.get_lang() );
+	}
+	else if ( term.get_datatype().get_value() ne XSD_NS _ "string" ) {
+		if ( opts{use_native_types} ) {
+			let dt := term.get_datatype().get_value();
+			if ( dt eq XSD_NS _ "boolean" and
+				lc(term.get_value()) in [ "true", "false" ] ) {
+				return lc(term.get_value()) eq "true";
+			}
+			if ( dt eq XSD_NS _ "integer" and term.get_value() ~ /^[+-]?[0-9]+$/ ) {
+				return 0 + term.get_value();
+			}
+		}
+		obj.set( "@type", term.get_datatype().get_value() );
+	}
+	return obj;
+}
+
+function _fromrdf_object ( term, Dict opts ) {
+	if ( term instanceof RDFLiteral ) {
+		return _fromrdf_value( term, opts );
+	}
+	return { "@id": _fromrdf_term_id(term) };
+}
+
+function _fromrdf_push_value ( Dict node, String key, value ) {
+	if ( not node.exists(key) ) {
+		node.set( key, [] );
+	}
+	node.get(key).push(value);
+}
+
+function _fromrdf_graph_nodes ( Array quads, graph, Dict opts ) {
+	let nodes := {};
+	for ( let quad in quads ) {
+		next unless rdf_term_key(quad.get_graph()) eq rdf_term_key(graph);
+		let sid := _fromrdf_term_id(quad.get_subject());
+		if ( not nodes.exists(sid) ) {
+			nodes.set( sid, { "@id": sid } );
+		}
+		let node := nodes.get(sid);
+		let pred := quad.get_predicate().get_value();
+		if ( pred eq RDF_NS _ "type" and not opts{use_rdf_type} ) {
+			_fromrdf_push_value( node, "@type", _fromrdf_term_id(quad.get_object()) );
+		}
+		else {
+			_fromrdf_push_value( node, pred, _fromrdf_object( quad.get_object(), opts ) );
+		}
+	}
+	let out := [];
+	for ( let id in nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		out.push(nodes.get(id));
+	}
+	return out;
+}
+
+function _fromrdf_options ( Dict raw? ) {
+	let source := raw == null ? {} : raw;
+	return {
+		use_native_types: source.exists("use_native_types") ? source{use_native_types} : false,
+		use_rdf_type: source.exists("use_rdf_type") ? source{use_rdf_type} : false,
+		rdf_direction: source.exists("rdf_direction") ? source{rdf_direction} : null,
+	};
+}
+
+function rdf_to_jsonld_data ( Array quads, Dict options? ) {
+	let opts := _fromrdf_options(options);
+	let source_quads := rdf_quads_unique(quads);
+	let out := _fromrdf_graph_nodes( source_quads, rdf_default_graph(), opts );
+	let graphs := {};
+	for ( let quad in source_quads ) {
+		next if quad.get_graph() instanceof RDFDefaultGraph;
+		graphs.set( rdf_term_key(quad.get_graph()), quad.get_graph() );
+	}
+	for ( let key in graphs.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let graph := graphs.get(key);
+		out.push({
+			"@id": _fromrdf_term_id(graph),
+			"@graph": _fromrdf_graph_nodes( source_quads, graph, opts ),
+		});
+	}
+	return out;
+}
+
+function jsonld_object_equals ( left, right ) {
+	return _jsonld_canonical(left) eq _jsonld_canonical(right);
+}
+
+function _jsonld_canonical ( value ) {
+	if ( value == null ) {
+		return "null";
+	}
+	if ( typeof value == "String" ) {
+		return "S:" _ replace( replace( value, /\\/, "\\\\", "g" ), "\n", "\\n", "g" );
+	}
+	if ( typeof value == "Number" or typeof value == "Boolean" ) {
+		return "" _ value;
+	}
+	if ( value instanceof Array ) {
+		let items := [];
+		for ( let item in value ) {
+			items.push(_jsonld_canonical(item));
+		}
+		return "[" _ join( ",", items.sort( fn ( a, b ) -> a cmp b ) ) _ "]";
+	}
+	if ( _jld_is_map(value) ) {
+		let items := [];
+		for ( let key in _jld_keys(value).sort( fn ( a, b ) -> a cmp b ) ) {
+			items.push(key _ ":" _ _jsonld_canonical(_jld_get( value, key )));
+		}
+		return "{" _ join( ",", items ) _ "}";
+	}
+	return "" _ value;
+}

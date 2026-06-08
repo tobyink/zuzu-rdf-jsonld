@@ -1,0 +1,17 @@
+=encoding utf8
+
+=head1 NAME
+
+rdf/parser/jsonld - JSON-LD parser.
+
+=cut
+
+from rdf/parser import RdfParser;
+from rdf/jsonld/core import jsonld_to_rdf;
+from std/data/json import JSON;
+
+class JsonLdParser with RdfParser {
+	method parse_string ( String text, ... PairList options ) {
+		return jsonld_to_rdf( ( new JSON() ).decode(text), ...options );
+	}
+}
