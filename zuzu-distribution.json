@@ -7,6 +7,8 @@
 	"status": "trial",
 	"abstract": "JSON-LD, YAML-LD, and CBOR-LD parsers and serializers for rdf",
 	"dependencies": {
+		"html/parser": "0",
+		"json/canonicalization": "0",
 		"rdf": "0",
 		"std/data/cbor": "0",
 		"std/data/json": "0",

@@ -2,12 +2,28 @@
 
 =head1 NAME
 
-rdf/serializer/cborld - CBOR-LD serializer.
+rdf/serializer/cborld - CBOR-LD serializers.
+
+=head1 EXPORTS
+
+=over
+
+=item C<CborLdSerializer>
+
+Serializes JSON-LD data as plain CBOR surface syntax.
+
+=item C<CompressedCborLdSerializer>
+
+Serializes RDF as tagged compressed CBOR-LD. It uses registry entry 1 by
+default, and accepts C<context>, C<registry_entry_id>, and
+C<registry_entries> constructor options.
+
+=back
 
 =cut
 
 from rdf/serializer import RdfSerializer;
-from rdf/jsonld/core import rdf_to_jsonld_data;
+from rdf/jsonld/core import jsonld_compact, jsonld_data_to_cborld, rdf_to_jsonld_data;
 from std/data/cbor import CBOR;
 
 class CborLdSerializer with RdfSerializer {
@@ -26,6 +42,40 @@ class CborLdSerializer with RdfSerializer {
 
 	method serialize ( Array quads ) {
 		return ( new CBOR() ).encode(self._data(quads));
+	}
+
+	method serialize_each ( Array quads, Function emit ) {
+		let data := self.serialize(quads);
+		emit(data) if data.length() > 0;
+		return self;
+	}
+}
+
+class CompressedCborLdSerializer with RdfSerializer {
+	let Boolean ordered with get := true;
+	let Boolean use_native_types with get := false;
+	let Boolean use_rdf_type with get := false;
+	let rdf_direction with get := null;
+	let context with get := null;
+	let Number registry_entry_id with get := 1;
+	let registry_entries with get := null;
+
+	method _data ( Array quads ) {
+		let data := rdf_to_jsonld_data(quads, {
+			use_native_types: use_native_types,
+			use_rdf_type: use_rdf_type,
+			rdf_direction: rdf_direction,
+		});
+		return data if context == null;
+		return jsonld_compact( data, context );
+	}
+
+	method serialize ( Array quads ) {
+		return ( new CBOR() ).encode(jsonld_data_to_cborld(
+			self._data(quads),
+			registry_entry_id: registry_entry_id,
+			registry_entries: registry_entries,
+		));
 	}
 
 	method serialize_each ( Array quads, Function emit ) {

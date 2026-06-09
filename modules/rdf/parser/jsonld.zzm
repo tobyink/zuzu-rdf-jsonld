@@ -7,11 +7,10 @@ rdf/parser/jsonld - JSON-LD parser.
 =cut
 
 from rdf/parser import RdfParser;
-from rdf/jsonld/core import jsonld_to_rdf;
-from std/data/json import JSON;
+from rdf/jsonld/core import jsonld_decode_text, jsonld_to_rdf;
 
 class JsonLdParser with RdfParser {
 	method parse_string ( String text, ... PairList options ) {
-		return jsonld_to_rdf( ( new JSON() ).decode(text), ...options );
+		return jsonld_to_rdf( jsonld_decode_text( text, ...options ), ...options );
 	}
 }

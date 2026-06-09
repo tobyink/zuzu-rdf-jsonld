@@ -6,18 +6,90 @@ requires_capability( "fs" );
 from rdf import NQuadsParser, rdf_datasets_isomorphic;
 from rdf/parser/jsonld import JsonLdParser;
 from rdf/serializer/jsonld import JsonLdSerializer;
-from rdf/jsonld/core import jsonld_object_equals;
+from rdf/jsonld import
+	jsonld_compact,
+	jsonld_decode_text,
+	jsonld_expand,
+	jsonld_flatten,
+	jsonld_frame,
+	jsonld_object_equals;
 from std/data/json import JSON;
 from std/io import Path;
+from std/string import split;
 
 let root := new Path("tests/w3c/json-ld-api");
 let to_rdf_manifest := root.child("toRdf-manifest.jsonld");
 let from_rdf_manifest := root.child("fromRdf-manifest.jsonld");
+let expand_manifest := root.child("expand-manifest.jsonld");
+let compact_manifest := root.child("compact-manifest.jsonld");
+let flatten_manifest := root.child("flatten-manifest.jsonld");
+let html_manifest := root.child("html-manifest.jsonld");
+let frame_manifest := root.child("frame-manifest.jsonld");
 
-if ( not to_rdf_manifest.exists() or not from_rdf_manifest.exists() ) {
+if ( not to_rdf_manifest.exists() or not from_rdf_manifest.exists() or
+	not expand_manifest.exists() or not compact_manifest.exists() or
+	not flatten_manifest.exists() or not html_manifest.exists() or
+	not frame_manifest.exists() ) {
 	pass("W3C JSON-LD manifests not vendored");
 	done_testing();
 }
+
+let supported_expand := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0004",
+	"#t0005",
+	"#t0006",
+	"#t0007",
+	"#t0008",
+	"#t0009",
+	"#t0010",
+	"#t0011",
+	"#t0012",
+	"#t0013",
+	"#t0014",
+	"#t0015",
+	"#t0016",
+];
+
+let supported_compact := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0004",
+	"#t0005",
+	"#t0006",
+	"#t0007",
+	"#t0008",
+	"#t0009",
+	"#t0010",
+	"#t0011",
+	"#t0012",
+	"#t0013",
+	"#t0014",
+	"#t0015",
+	"#t0016",
+];
+
+let supported_flatten := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0004",
+	"#t0005",
+	"#t0006",
+	"#t0007",
+	"#t0008",
+	"#t0009",
+	"#t0010",
+	"#t0011",
+	"#t0012",
+	"#t0013",
+	"#t0014",
+	"#t0015",
+	"#t0016",
+];
 
 let supported_to_rdf := [
 	"#t0001",
@@ -33,6 +105,29 @@ let supported_to_rdf := [
 	"#t0014",
 	"#t0015",
 	"#t0016",
+	"#tjs01",
+	"#tjs02",
+	"#tjs03",
+	"#tjs04",
+	"#tjs05",
+	"#tjs06",
+	"#tjs07",
+	"#tjs08",
+	"#tjs09",
+	"#tjs10",
+	"#tjs11",
+	"#tjs12",
+	"#tjs13",
+	"#tjs14",
+	"#tjs15",
+	"#tjs16",
+	"#tjs17",
+	"#tjs18",
+	"#tjs19",
+	"#tjs20",
+	"#tjs21",
+	"#tjs22",
+	"#tjs23",
 ];
 
 let supported_from_rdf := [
@@ -40,6 +135,114 @@ let supported_from_rdf := [
 	"#t0002",
 	"#t0003",
 	"#t0017",
+];
+
+let supported_html_expand := [
+	"#te001",
+	"#te002",
+	"#te003",
+	"#te004",
+	"#te005",
+	"#te007",
+	"#te010",
+];
+
+let supported_frame := [
+	"#t0001",
+	"#t0002",
+	"#t0003",
+	"#t0004",
+	"#t0005",
+	"#t0006",
+	"#t0007",
+	"#t0008",
+	"#t0009",
+	"#t0010",
+	"#t0011",
+	"#t0012",
+	"#t0013",
+	"#t0014",
+	"#t0015",
+	"#t0016",
+	"#t0017",
+	"#t0018",
+	"#t0019",
+	"#t0020",
+	"#t0021",
+	"#t0022",
+	"#t0023",
+	"#t0024",
+	"#t0025",
+	"#t0026",
+	"#t0027",
+	"#t0028",
+	"#t0029",
+	"#t0030",
+	"#t0031",
+	"#t0032",
+	"#t0033",
+	"#t0034",
+	"#t0035",
+	"#t0036",
+	"#t0037",
+	"#t0038",
+	"#t0039",
+	"#t0040",
+	"#t0041",
+	"#t0042",
+	"#t0043",
+	"#t0044",
+	"#t0045",
+	"#t0046",
+	"#t0047",
+	"#t0048",
+	"#t0049",
+	"#t0050",
+	"#t0051",
+	"#t0055",
+	"#t0056",
+	"#t0057",
+	"#t0058",
+	"#t0059",
+	"#t0060",
+	"#t0061",
+	"#t0062",
+	"#t0063",
+	"#t0064",
+	"#t0065",
+	"#t0066",
+	"#t0067",
+	"#t0068",
+	"#t0069",
+	"#t0070",
+	"#teo01",
+	"#tg001",
+	"#tg002",
+	"#tg003",
+	"#tg004",
+	"#tg005",
+	"#tg006",
+	"#tg007",
+	"#tg008",
+	"#tg009",
+	"#tg010",
+	"#tin01",
+	"#tin02",
+	"#tin03",
+	"#tp020",
+	"#tp021",
+	"#tp046",
+	"#tp049",
+	"#tp050",
+	"#tra01",
+	"#tra02",
+	"#tra03",
+];
+
+let supported_frame_negative := [
+	"#t0052",
+	"#t0053",
+	"#t0054",
 ];
 
 let json := new JSON();
@@ -60,9 +263,198 @@ function _option_dict ( raw ) {
 			if raw.exists("useRdfType");
 		out.set( "rdf_direction", raw.get("rdfDirection") )
 			if raw.exists("rdfDirection");
+		out.set( "spec_version", raw.get("specVersion") )
+			if raw.exists("specVersion");
+		out.set( "processing_mode", raw.get("processingMode") )
+			if raw.exists("processingMode");
+		out.set( "content_type", raw.get("contentType") )
+			if raw.exists("contentType");
+		out.set( "extract_all_scripts", raw.get("extractAllScripts") )
+			if raw.exists("extractAllScripts");
+		out.set( "base", raw.get("base") )
+			if raw.exists("base");
+		out.set( "use_jcs", raw.get("useJCS") )
+			if raw.exists("useJCS");
 	}
 	return out;
 }
+
+function _input_path ( String input ) {
+	return split( input, "#", 2 )[0];
+}
+
+let expand_cases := _manifest(expand_manifest);
+let expand_count := 0;
+let expand_seen := 0;
+for ( let c in expand_cases{sequence} ) {
+	expand_seen++ if c{"@id"} in supported_expand;
+	next unless c{"@id"} in supported_expand;
+	expand_count++;
+	let input := "" _ c{input};
+	let actual := jsonld_expand(
+		json.load(root.child(input)),
+		{ base: expand_cases{baseIri} _ input },
+	);
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD Expand " _ c{"@id"},
+	);
+}
+is(
+	expand_seen,
+	supported_expand.length(),
+	"supported W3C Expand cases discovered",
+);
+ok( expand_count > 0, "W3C Expand cases executed" );
+
+let html_cases := _manifest(html_manifest);
+let html_expand_count := 0;
+let html_expand_seen := 0;
+for ( let c in html_cases{sequence} ) {
+	html_expand_seen++ if c{"@id"} in supported_html_expand;
+	next unless c{"@id"} in supported_html_expand;
+	html_expand_count++;
+	let input := "" _ c{input};
+	let opts := _option_dict(c{option});
+	let base := opts.exists("base") ?
+		opts{base} :
+		html_cases{baseIri} _ input;
+	opts.set( "base", base );
+	opts.set( "content_type", "text/html" )
+		unless opts.exists("content_type");
+	let data := jsonld_decode_text(
+		root.child(_input_path(input)).slurp_utf8(),
+		base: opts{base},
+		content_type: opts{content_type},
+		extract_all_scripts: opts.exists("extract_all_scripts") ?
+			opts{extract_all_scripts} :
+			false,
+	);
+	let actual := jsonld_expand(data, opts);
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD HTML Expand " _ c{"@id"},
+	);
+}
+is(
+	html_expand_seen,
+	supported_html_expand.length(),
+	"supported W3C HTML Expand cases discovered",
+);
+ok( html_expand_count > 0, "W3C HTML Expand cases executed" );
+
+let compact_cases := _manifest(compact_manifest);
+let compact_count := 0;
+let compact_seen := 0;
+for ( let c in compact_cases{sequence} ) {
+	compact_seen++ if c{"@id"} in supported_compact;
+	next unless c{"@id"} in supported_compact;
+	compact_count++;
+	let input := "" _ c{input};
+	let actual := jsonld_compact(
+		json.load(root.child(input)),
+		json.load(root.child("" _ c{context})),
+		{ base: compact_cases{baseIri} _ input },
+	);
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD Compact " _ c{"@id"},
+	);
+}
+is(
+	compact_seen,
+	supported_compact.length(),
+	"supported W3C Compact cases discovered",
+);
+ok( compact_count > 0, "W3C Compact cases executed" );
+
+let flatten_cases := _manifest(flatten_manifest);
+let flatten_count := 0;
+let flatten_seen := 0;
+for ( let c in flatten_cases{sequence} ) {
+	flatten_seen++ if c{"@id"} in supported_flatten;
+	next unless c{"@id"} in supported_flatten;
+	flatten_count++;
+	let input := "" _ c{input};
+	let actual := jsonld_flatten(
+		json.load(root.child(input)),
+		null,
+		{ base: flatten_cases{baseIri} _ input },
+	);
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD Flatten " _ c{"@id"},
+	);
+}
+is(
+	flatten_seen,
+	supported_flatten.length(),
+	"supported W3C Flatten cases discovered",
+);
+ok( flatten_count > 0, "W3C Flatten cases executed" );
+
+let frame_cases := _manifest(frame_manifest);
+let frame_count := 0;
+let frame_seen := 0;
+let frame_negative_count := 0;
+let frame_negative_seen := 0;
+for ( let c in frame_cases{sequence} ) {
+	frame_seen++ if c{"@id"} in supported_frame;
+	next unless c{"@id"} in supported_frame;
+	frame_count++;
+	let input := "" _ c{input};
+	let opts := _option_dict(c{option});
+	opts.set( "base", frame_cases{baseIri} _ input );
+	let actual := jsonld_frame(
+		json.load(root.child(input)),
+		json.load(root.child("" _ c{frame})),
+		opts,
+	);
+	let expected := json.load(root.child("" _ c{expect}));
+	ok(
+		jsonld_object_equals( actual, expected ),
+		"W3C JSON-LD Frame " _ c{"@id"},
+	);
+}
+for ( let c in frame_cases{sequence} ) {
+	frame_negative_seen++ if c{"@id"} in supported_frame_negative;
+	next unless c{"@id"} in supported_frame_negative;
+	frame_negative_count++;
+	let input := "" _ c{input};
+	let opts := _option_dict(c{option});
+	opts.set( "base", frame_cases{baseIri} _ input );
+	let died := false;
+	try {
+		jsonld_frame(
+			json.load(root.child(input)),
+			json.load(root.child("" _ c{frame})),
+			opts,
+		);
+	}
+	catch ( Exception e ) {
+		died := true;
+	}
+	ok(
+		died,
+		"W3C JSON-LD Frame negative " _ c{"@id"},
+	);
+}
+is(
+	frame_seen,
+	supported_frame.length(),
+	"supported W3C Frame cases discovered",
+);
+is(
+	frame_negative_seen,
+	supported_frame_negative.length(),
+	"supported W3C negative Frame cases discovered",
+);
+ok( frame_count > 0, "W3C Frame cases executed" );
+ok( frame_negative_count > 0, "W3C negative Frame cases executed" );
 
 let to_manifest := _manifest(to_rdf_manifest);
 let to_count := 0;
@@ -72,9 +464,12 @@ for ( let c in to_manifest{sequence} ) {
 	next unless c{"@id"} in supported_to_rdf;
 	to_count++;
 	let input := "" _ c{input};
+	let to_opts := _option_dict(c{option});
+	let use_jcs := to_opts.exists("use_jcs") ? to_opts{use_jcs} : false;
 	let actual := jsonld_parser.parse_file(
 		root.child(input),
 		base: to_manifest{baseIri} _ input,
+		use_jcs: use_jcs,
 	);
 	let expected := nq_parser.parse_file(root.child("" _ c{expect}));
 	ok(

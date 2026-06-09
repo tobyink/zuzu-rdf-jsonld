@@ -12,11 +12,19 @@ from rdf import
 	rdf_quad;
 from rdf/parser/jsonld import JsonLdParser;
 from rdf/parser/yamlld import YamlLdParser;
-from rdf/parser/cborld import CborLdParser;
+from rdf/parser/cborld import CborLdParser, CompressedCborLdParser;
 from rdf/serializer/jsonld import JsonLdSerializer;
 from rdf/serializer/yamlld import YamlLdSerializer;
-from rdf/serializer/cborld import CborLdSerializer;
+from rdf/serializer/cborld import CborLdSerializer, CompressedCborLdSerializer;
+from rdf/jsonld import
+	cborld_to_jsonld_data,
+	jsonld_compact,
+	jsonld_data_to_cborld,
+	jsonld_expand,
+	jsonld_flatten,
+	jsonld_frame;
 from std/data/cbor import CBOR;
+from std/data/cbor import TaggedValue;
 from std/data/json import JSON;
 
 class FakeStore {
@@ -128,6 +136,292 @@ ok(
 		cbor_quads,
 	),
 	"CBOR-LD serializer output parses back to equivalent RDF",
+);
+
+let compressed_parser := new CompressedCborLdParser();
+ok(
+	compressed_parser does RdfParser,
+	"CompressedCborLdParser composes RdfParser",
+);
+let compressed_serializer := new CompressedCborLdSerializer(
+	context: { "@context": { ex: "http://example.com/", p: "ex:p" } },
+);
+ok(
+	compressed_serializer does RdfSerializer,
+	"CompressedCborLdSerializer composes RdfSerializer",
+);
+let compressed := compressed_serializer.serialize(cbor_quads);
+let compressed_decoded := ( new CBOR() ).decode(compressed);
+ok( compressed_decoded instanceof TaggedValue, "compressed CBOR-LD is tagged" );
+is( compressed_decoded{tag}, 51997, "compressed CBOR-LD uses tag 51997" );
+is( compressed_decoded{value}[0], 1, "compressed CBOR-LD uses registry entry 1" );
+let compressed_payload := compressed_decoded{value}[1];
+ok( compressed_payload.exists(0), "compressed CBOR-LD compresses @context key" );
+ok( compressed_payload.exists(102), "compressed CBOR-LD compresses context term key" );
+ok(
+	rdf_datasets_isomorphic(
+		compressed_parser.parse_binary(compressed),
+		cbor_quads,
+	),
+	"compressed CBOR-LD output parses back to equivalent RDF",
+);
+
+let tagged_plain := ( new CBOR() ).encode(
+	new TaggedValue( tag: 51997, value: [ 0, ( new CBOR() ).decode(cbor_data) ] ),
+);
+ok(
+	rdf_datasets_isomorphic(
+		compressed_parser.parse_binary(tagged_plain, base: "http://example.com/"),
+		cbor_quads,
+	),
+	"compressed parser accepts tagged uncompressed registry entry 0",
+);
+
+let registry_entries := {
+	"100": {
+		id: 100,
+		compressionTable: [
+			{
+				type: "context",
+				table: {
+					"1": "https://example.com/ctx",
+				},
+			},
+			{
+				type: "url",
+				table: {
+					"1": "http://example.com/s",
+				},
+			},
+		],
+	},
+};
+let custom_doc := {
+	"@context": "https://example.com/ctx",
+	"@id": "http://example.com/s",
+};
+let custom_tagged := ( new CBOR() ).encode(jsonld_data_to_cborld(
+	custom_doc,
+	registry_entry_id: 100,
+	registry_entries: registry_entries,
+));
+let custom_decoded := ( new CBOR() ).decode(custom_tagged);
+is( custom_decoded{value}[0], 100, "custom registry entry id is encoded" );
+let custom_payload := custom_decoded{value}[1];
+is(
+	custom_payload.get(0),
+	1,
+	"custom context table compresses context URL",
+);
+is(
+	custom_payload.get(4),
+	1,
+	"custom URL table compresses @id value",
+);
+is(
+	( new JSON(canonical: true) ).encode(cborld_to_jsonld_data(
+		custom_decoded,
+		registry_entries: registry_entries,
+	)),
+	( new JSON(canonical: true) ).encode(custom_doc),
+	"custom registry tables decompress to JSON-LD",
+);
+
+function _dies ( Function thunk ) {
+	let died := false;
+	try {
+		thunk();
+	}
+	catch ( Exception e ) {
+		died := true;
+	}
+	return died;
+}
+
+ok(
+	_dies(function () { compressed_parser.parse_binary(cbor_data); }),
+	"compressed parser rejects untagged CBOR",
+);
+ok(
+	_dies(function () {
+		compressed_parser.parse_binary(( new CBOR() ).encode(
+			new TaggedValue( tag: 9, value: [ 1, {} ] ),
+		));
+	}),
+	"compressed parser rejects wrong CBOR tag",
+);
+ok(
+	_dies(function () {
+		compressed_parser.parse_binary(( new CBOR() ).encode(
+			new TaggedValue( tag: 51997, value: [ 999, {} ] ),
+		));
+	}),
+	"compressed parser rejects unknown registry id",
+);
+ok(
+	_dies(function () {
+		let bad_terms := {};
+		bad_terms.set( 999, "bad" );
+		compressed_parser.parse_binary(( new CBOR() ).encode(
+			new TaggedValue( tag: 51997, value: [ 1, bad_terms ] ),
+		));
+	}),
+	"compressed parser rejects unknown compressed term id",
+);
+ok(
+	_dies(function () {
+		let bad_context := {};
+		bad_context.set( 0, 999 );
+		compressed_parser.parse_binary(
+			( new CBOR() ).encode(new TaggedValue(
+				tag: 51997,
+				value: [ 100, bad_context ],
+			)),
+			registry_entries: registry_entries,
+		);
+	}),
+	"compressed parser rejects unknown compressed table value",
+);
+
+let json := new JSON(canonical: true);
+let api_doc := json.decode("""
+{
+  "@context": {"ex": "http://example.com/"},
+  "@id": "ex:s",
+  "@type": "ex:T",
+  "ex:p": "value"
+}
+""");
+let expanded := jsonld_expand(api_doc, { base: "http://example.com/" });
+is(
+	json.encode(expanded),
+	"[{\"@id\":\"http://example.com/s\",\"@type\":[\"http://example.com/T\"],\"http://example.com/p\":[{\"@value\":\"value\"}]}]",
+	"jsonld_expand returns expanded JSON-LD data",
+);
+let compacted := jsonld_compact(expanded, {
+	"@context": { ex: "http://example.com/" },
+}, { base: "http://example.com/" });
+is(
+	json.encode(compacted),
+	"{\"@context\":{\"ex\":\"http://example.com/\"},\"@id\":\"ex:s\",\"@type\":\"ex:T\",\"ex:p\":\"value\"}",
+	"jsonld_compact compacts expanded JSON-LD with a context",
+);
+let flattened := jsonld_flatten(api_doc, null, { base: "http://example.com/" });
+is(
+	json.encode(flattened),
+	json.encode(expanded),
+	"jsonld_flatten returns a flattened node array for simple input",
+);
+
+let remote_count := 0;
+let remote_loader := function ( String url ) {
+	remote_count := remote_count + 1;
+	if ( url eq "http://example.com/ctx/main" ) {
+		return {
+			document: { "@context": "nested" },
+			document_url: url,
+		};
+	}
+	if ( url eq "http://example.com/nested" ) {
+		return {
+			document: {
+				"@context": {
+					ex: "http://example.com/",
+					name: "ex:name",
+				},
+			},
+			document_url: url,
+		};
+	}
+	die "unexpected remote URL " _ url;
+};
+let remote_doc := json.decode("""
+{
+  "@context": ["ctx/main", "ctx/main"],
+  "@id": "ex:s",
+  "name": "Remote"
+}
+""");
+let remote_expanded := jsonld_expand(remote_doc, {
+	base: "http://example.com/doc",
+	document_loader: remote_loader,
+});
+is(
+	json.encode(remote_expanded),
+	"[{\"@id\":\"http://example.com/s\",\"http://example.com/name\":[{\"@value\":\"Remote\"}]}]",
+	"jsonld_expand loads and applies remote contexts",
+);
+is( remote_count, 2, "remote context loader caches documents during expansion" );
+
+let linked_loader := function ( String url ) {
+	if ( url eq "http://example.com/doc-context" ) {
+		return {
+			document: {},
+			document_url: url,
+			context_url: "linked-context",
+		};
+	}
+	if ( url eq "http://example.com/linked-context" ) {
+		return {
+			document: {
+				"@context": {
+					ex: "http://example.com/",
+					p: "ex:p",
+				},
+			},
+			document_url: url,
+		};
+	}
+	die "unexpected linked remote URL " _ url;
+};
+let linked_quads := parser.parse_string("""
+{
+  "@context": "doc-context",
+  "@id": "ex:s",
+  "p": "via link"
+}
+""", base: "http://example.com/input", document_loader: linked_loader);
+is( linked_quads.length(), 1, "parser applies linked remote context" );
+
+let html_quads := parser.parse_string("""
+<html><head>
+<script id="data" type="application/ld+json">
+{
+  "@context": {"ex": "http://example.com/"},
+  "@id": "ex:s",
+  "ex:p": "from html"
+}
+</script>
+</head></html>
+""", base: "http://example.com/page#data", content_type: "text/html");
+is( html_quads.length(), 1, "parser extracts targeted JSON-LD from HTML" );
+
+let framed := jsonld_frame(
+	json.decode("""
+{
+  "@context": {
+    "ex": "http://example.com/",
+    "ex:child": {"@type": "@id"}
+  },
+  "@graph": [
+    {"@id": "ex:parent", "@type": "ex:Parent", "ex:child": "ex:child"},
+    {"@id": "ex:child", "@type": "ex:Child", "ex:name": "Kid"}
+  ]
+}
+"""),
+	json.decode("""
+{
+  "@context": {"ex": "http://example.com/"},
+  "@type": "ex:Parent",
+  "ex:child": {"@type": "ex:Child"}
+}
+"""),
+	{ base: "http://example.com/" },
+);
+is(
+	json.encode(framed),
+	"{\"@context\":{\"ex\":\"http://example.com/\"},\"@id\":\"ex:parent\",\"@type\":\"ex:Parent\",\"ex:child\":{\"@id\":\"ex:child\",\"@type\":\"ex:Child\",\"ex:name\":\"Kid\"}}",
+	"jsonld_frame embeds matching referenced nodes",
 );
 
 done_testing();

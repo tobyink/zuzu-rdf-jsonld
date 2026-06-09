@@ -26,14 +26,24 @@ from rdf/term import
 	rdf_quad,
 	rdf_term_key;
 from rdf/graph import rdf_quads_unique;
+from std/data/json import JSON;
+from std/data/cbor import TaggedValue;
+from std/net/http import UserAgent;
 from std/string import contains, index, join, replace, split, starts_with, substr;
+from json/canonicalization import jcs_canonicalize;
 
 const JSONLD_NS := "http://www.w3.org/ns/json-ld#";
+let _jld_json_decoder := new JSON();
 
 function _jld_expand_iri;
 function _jld_object_term;
 function _jld_rdf_list;
 function _jld_node;
+function _jld_expand_element;
+function _jld_compact_value;
+function _jld_frame_matches;
+function _jld_frame_embed;
+function _jld_frame_equivalent_key;
 function _jsonld_canonical;
 
 function _jld_has ( obj, String key ) {
@@ -101,6 +111,141 @@ function _jld_resolve ( String value, String base ) {
 	return ( new RDFReader(source: "") ).set_base(base).resolve_iri(value);
 }
 
+function _jld_link_header_context ( header ) {
+	return null if header == null;
+	for ( let part in split( "" _ header, "," ) ) {
+		next unless contains( part, JSONLD_NS _ "context" );
+		let start := index( part, "<" );
+		let end := index( part, ">" );
+		if ( start >= 0 and end > start ) {
+			return substr( part, start + 1, end - start - 1 );
+		}
+	}
+	return null;
+}
+
+function _jld_default_document_loader ( String url ) {
+	let ua := new UserAgent(
+		default_headers: {
+			Accept: "application/ld+json, application/json;q=0.9, */*;q=0.1",
+		},
+	);
+	let res := ua.get(url).expect_success();
+	return {
+		document: res.json(),
+		document_url: res.url(),
+		content_type: res.header("content-type"),
+		context_url: _jld_link_header_context(res.header("link")),
+	};
+}
+
+function _jld_load_remote_document ( Dict ctx, String url ) {
+	let cache := ctx{context_cache};
+	return cache.get(url) if cache.exists(url);
+	let loader := ctx{document_loader};
+	let loaded := loader == null ?
+		_jld_default_document_loader(url) :
+		(
+			loader instanceof Function ?
+				loader(url) :
+				loader.load_document(url)
+		);
+	let out := _jld_is_map(loaded) and _jld_has( loaded, "document" ) ?
+		loaded :
+		{ document: loaded, document_url: url, content_type: null, context_url: null };
+	cache.set( url, out );
+	return out;
+}
+
+function _jld_remote_context_value ( Dict ctx, String raw_url ) {
+	let url := _jld_resolve( raw_url, ctx{base} );
+	let loaded := _jld_load_remote_document( ctx, url );
+	let previous_base := ctx{base};
+	ctx{base} := _jld_get( loaded, "document_url", url );
+	if ( _jld_get( loaded, "context_url", null ) != null ) {
+		let linked := _jld_remote_context_value(
+			ctx,
+			"" _ _jld_get( loaded, "context_url" ),
+		);
+		ctx{base} := previous_base;
+		return linked;
+	}
+	let document := _jld_get( loaded, "document" );
+	let context := _jld_is_map(document) and _jld_has( document, "@context" ) ?
+		_jld_get( document, "@context" ) :
+		document;
+	ctx{base} := previous_base;
+	return context;
+}
+
+function _jld_text_options ( PairList options ) {
+	let out := {
+		base: "",
+		content_type: "",
+		extract_all_scripts: false,
+	};
+	for ( let pair in options.to_Array() ) {
+		if ( pair.key eq "base" ) {
+			out{base} := "" _ pair.value;
+		}
+		else if ( pair.key eq "content_type" ) {
+			out{content_type} := lc("" _ pair.value);
+		}
+		else if ( pair.key eq "extract_all_scripts" ) {
+			out{extract_all_scripts} := pair.value ? true : false;
+		}
+	}
+	return out;
+}
+
+function _jld_html_fragment ( String base ) {
+	return "" unless contains( base, "#" );
+	let parts := split( base, "#", 2 );
+	return parts.length() > 1 ? parts[1] : "";
+}
+
+function _jld_html_script_documents (
+	String text,
+	String base,
+	Boolean extract_all
+) {
+	from html/parser import HTML;
+	let json := new JSON();
+	let fragment := _jld_html_fragment(base);
+	let doc := HTML.parse(text);
+	let out := [];
+	for ( let el in doc.getElementsByTagName("script") ) {
+		let type := el.getAttribute("type");
+		next unless type != null and lc(type) eq "application/ld+json";
+		let id := el.getAttribute("id");
+		next if fragment ne "" and id ne fragment;
+		out.push( json.decode( el.textContent() ) );
+		last unless extract_all and fragment eq "";
+	}
+	if ( fragment ne "" and out.length() == 0 ) {
+		die "jsonld: loading document failed";
+	}
+	if ( out.length() == 0 ) {
+		die "jsonld: loading document failed" unless extract_all;
+		return [];
+	}
+	return extract_all and fragment eq "" ? out : out[0];
+}
+
+function jsonld_decode_text ( String text, ... PairList options ) {
+	let opts := _jld_text_options(options);
+	if ( contains( opts{content_type}, "html" ) or
+		starts_with( lc(text), "<!doctype" ) or
+		starts_with( lc(text), "<html" ) ) {
+		return _jld_html_script_documents(
+			text,
+			opts{base},
+			opts{extract_all_scripts},
+		);
+	}
+	return ( new JSON() ).decode(text);
+}
+
 function _jld_context () {
 	return {
 		base: "",
@@ -108,6 +253,8 @@ function _jld_context () {
 		language: "",
 		terms: {},
 		aliases: {},
+		document_loader: null,
+		context_cache: {},
 	};
 }
 
@@ -118,6 +265,8 @@ function _jld_context_clone ( Dict ctx ) {
 		language: ctx{language},
 		terms: {},
 		aliases: {},
+		document_loader: ctx{document_loader},
+		context_cache: ctx{context_cache},
 	};
 	let ctx_terms := ctx{terms};
 	let next_terms := next_ctx{terms};
@@ -128,6 +277,8 @@ function _jld_context_clone ( Dict ctx ) {
 			"type": term.get("type"),
 			container: term.get("container"),
 			language: term.get("language"),
+			reverse: term.get("reverse"),
+			context: term.get("context"),
 		});
 	}
 	let ctx_aliases := ctx{aliases};
@@ -138,11 +289,38 @@ function _jld_context_clone ( Dict ctx ) {
 	return next_ctx;
 }
 
+function _jld_context_reset ( Dict ctx ) {
+	let next_ctx := _jld_context();
+	next_ctx{base} := ctx{base};
+	next_ctx{document_loader} := ctx{document_loader};
+	next_ctx{context_cache} := ctx{context_cache};
+	return next_ctx;
+}
+
 function _jld_keyword ( Dict ctx, String key ) {
 	return key if starts_with( key, "@" );
 	let aliases := ctx{aliases};
 	return aliases.get(key) if aliases.exists(key);
 	return key;
+}
+
+function _jld_keyword_key ( obj, Dict ctx, String keyword ) {
+	for ( let key in _jld_keys(obj) ) {
+		return key if _jld_keyword( ctx, key ) eq keyword;
+	}
+	return keyword;
+}
+
+function _jld_keyword_has ( obj, Dict ctx, String keyword ) {
+	let key := _jld_keyword_key( obj, ctx, keyword );
+	return _jld_has( obj, key ) and _jld_keyword( ctx, key ) eq keyword;
+}
+
+function _jld_keyword_get ( obj, Dict ctx, String keyword, fallback := null ) {
+	let key := _jld_keyword_key( obj, ctx, keyword );
+	return _jld_get( obj, key, fallback )
+		if _jld_has( obj, key ) and _jld_keyword( ctx, key ) eq keyword;
+	return fallback;
 }
 
 function _jld_term_id_from_value ( String term, value, Dict ctx ) {
@@ -172,12 +350,34 @@ function _jld_term_container_from_value ( value ) {
 	return raw == null ? null : "" _ raw;
 }
 
+function _jld_term_reverse_from_value ( value ) {
+	return _jld_is_map(value) and _jld_has( value, "@reverse" );
+}
+
+function _jld_context_normalize_terms ( Dict ctx ) {
+	let terms := ctx{terms};
+	for ( let key in terms.keys() ) {
+		let term := terms.get(key);
+		let id := term.get("id");
+		if ( typeof id == "String" and id ne "" and not starts_with( id, "@" ) ) {
+			term.set( "id", _jld_expand_iri( id, ctx, true, true ) );
+		}
+		let type := term.get("type");
+		if ( typeof type == "String" and type ne "" and
+			not starts_with( type, "@" ) ) {
+			term.set( "type", _jld_expand_iri( type, ctx, true, true ) );
+		}
+	}
+	return ctx;
+}
+
 function _jld_apply_context_item ( Dict ctx, item ) {
 	if ( item == null ) {
-		return _jld_context();
+		return _jld_context_reset(ctx);
 	}
 	if ( typeof item == "String" ) {
-		die "jsonld: remote contexts are not supported";
+		let remote_context := _jld_remote_context_value( ctx, "" _ item );
+		return _jld_apply_context_item( ctx, remote_context );
 	}
 	if ( item instanceof Array ) {
 		let working := ctx;
@@ -208,26 +408,50 @@ function _jld_apply_context_item ( Dict ctx, item ) {
 		}
 		else {
 			let id := _jld_term_id_from_value( key, value, ctx );
-			let expanded := id;
 			if ( starts_with( id, "@" ) ) {
 				let aliases := ctx{aliases};
 				aliases.set( key, id );
 			}
-			else {
-				expanded := _jld_expand_iri( id, ctx, true, true );
-			}
 			let terms := ctx{terms};
 			terms.set( key, {
-				id: expanded,
-				"type": _jld_term_type_from_value( value, ctx ),
+				id: id,
+				"type": null,
 				container: _jld_term_container_from_value(value),
 				language: _jld_is_map(value) ?
 					_jld_get( value, "@language", ctx{language} ) :
 					ctx{language},
+				reverse: _jld_term_reverse_from_value(value),
+				context: _jld_is_map(value) ?
+					_jld_get( value, "@context", null ) :
+					null,
 			});
 		}
 	}
-	return ctx;
+	for ( let key in _jld_keys(item) ) {
+		next if starts_with( key, "@" );
+		let value := _jld_get( item, key );
+		next if value == null;
+		let terms := ctx{terms};
+		next unless terms.exists(key);
+		let term := terms.get(key);
+		let id := term.get("reverse") ?
+			"" _ _jld_get( value, "@reverse" ) :
+			_jld_term_id_from_value( key, value, ctx );
+		let expanded := id;
+		if ( _jld_is_map(value) and not _jld_has( value, "@id" ) and
+			not _jld_has( value, "@reverse" ) and id eq key and ctx{vocab} ne "" ) {
+			expanded := ctx{vocab} _ key;
+		}
+		else if ( starts_with( id, "@" ) ) {
+			expanded := id;
+		}
+		else {
+			expanded := _jld_expand_iri( id, ctx, true, true );
+		}
+		term.set( "id", expanded );
+		term.set( "type", _jld_term_type_from_value( value, ctx ) );
+	}
+	return _jld_context_normalize_terms(ctx);
 }
 
 function _jld_apply_context ( Dict ctx, value ) {
@@ -265,8 +489,17 @@ function _jld_expand_iri (
 	return value;
 }
 
-function _jld_state () {
-	return { quads: [], bnodes: {}, count: 0 };
+function _jld_expand_property_iri ( String key, Dict ctx ) {
+	let terms := ctx{terms};
+	if ( terms.exists(key) ) {
+		let term := terms.get(key);
+		return term.get("id");
+	}
+	return _jld_expand_iri( key, ctx, true, false );
+}
+
+function _jld_state ( Boolean use_jcs := false ) {
+	return { quads: [], bnodes: {}, count: 0, use_jcs: use_jcs };
 }
 
 function _jld_bnode ( Dict state, String label := "" ) {
@@ -312,13 +545,18 @@ function _jld_native_literal ( value ) {
 	return rdf_literal("" _ value);
 }
 
-function _jld_value_object ( value, Dict ctx, termdef ) {
-	let lang := _jld_get( value, "@language", "" );
-	let datatype := _jld_get( value, "@type", null );
-	let raw := _jld_get( value, "@value", "" );
+function _jld_value_object ( value, Dict ctx, termdef, Dict state := null ) {
+	let lang := _jld_keyword_get( value, ctx, "@language", "" );
+	let datatype := _jld_keyword_get( value, ctx, "@type", null );
+	let raw := _jld_keyword_get( value, ctx, "@value", "" );
 	if ( datatype != null ) {
 		datatype := _jld_expand_iri( "" _ datatype, ctx, true, true );
-		return rdf_literal( raw, "", rdf_iri(datatype) );
+		if ( datatype eq RDF_NS _ "JSON" or datatype eq "@json" ) {
+			let use_jcs := state != null and state.exists("use_jcs") and state{use_jcs};
+			let lexical := use_jcs ? jcs_canonicalize( raw ) : _jld_json_decoder.encode(raw);
+			return rdf_literal( lexical, "", rdf_iri(RDF_NS _ "JSON") );
+		}
+		return rdf_literal( "" _ raw, "", rdf_iri(datatype) );
 	}
 	if ( lang ne "" ) {
 		return rdf_literal( raw, "" _ lang );
@@ -331,13 +569,19 @@ function _jld_value_object ( value, Dict ctx, termdef ) {
 }
 
 function _jld_object_term ( value, Dict ctx, Dict state, graph, termdef ) {
+	// @json typed terms: the value is always an atomic JSON literal.
+	if ( termdef != null and termdef.get("type") eq "@json" ) {
+		let use_jcs := state != null and state.exists("use_jcs") and state{use_jcs};
+		let lexical := use_jcs ? jcs_canonicalize(value) : _jld_json_decoder.encode(value);
+		return rdf_literal( lexical, "", rdf_iri(RDF_NS _ "JSON") );
+	}
 	if ( _jld_is_map(value) ) {
 		let local_ctx := ctx;
 		if ( _jld_has( value, "@context" ) ) {
 			local_ctx := _jld_apply_context( ctx, _jld_get( value, "@context" ) );
 		}
-		if ( _jld_has( value, "@value" ) ) {
-			return _jld_value_object( value, local_ctx, termdef );
+		if ( _jld_keyword_has( value, local_ctx, "@value" ) ) {
+			return _jld_value_object( value, local_ctx, termdef, state );
 		}
 		if ( _jld_has( value, "@list" ) ) {
 			return _jld_rdf_list(
@@ -419,6 +663,12 @@ function _jld_add_values (
 	termdef
 ) {
 	let predicate := rdf_iri(predicate_iri);
+	// @json typed terms are atomic — never unwrap arrays into multiple triples.
+	if ( termdef != null and termdef.get("type") eq "@json" ) {
+		let object := _jld_object_term( value, ctx, state, graph, termdef );
+		_jld_add( state, subject, predicate, object, graph );
+		return null;
+	}
 	for ( let item in _jld_array(value) ) {
 		let object := _jld_object_term( item, ctx, state, graph, termdef );
 		_jld_add( state, subject, predicate, object, graph );
@@ -430,7 +680,7 @@ function _jld_process_reverse ( Dict state, subject, reverse, Dict ctx, graph ) 
 	for ( let key in _jld_keys(reverse) ) {
 		let terms := ctx{terms};
 		let termdef := terms.exists(key) ? terms.get(key) : null;
-		let predicate_iri := _jld_expand_iri( key, ctx, true, false );
+		let predicate_iri := _jld_expand_property_iri( key, ctx );
 		for ( let item in _jld_array(_jld_get( reverse, key )) ) {
 			let object := _jld_object_term( item, ctx, state, graph, termdef );
 			_jld_add( state, object, rdf_iri(predicate_iri), subject, graph );
@@ -476,8 +726,15 @@ function _jld_node ( value, Dict ctx, Dict state, graph ) {
 		next if starts_with( keyword, "@" );
 		let terms := active_ctx{terms};
 		let termdef := terms.exists(key) ? terms.get(key) : null;
-		let predicate_iri := _jld_expand_iri( key, active_ctx, true, false );
+		let predicate_iri := _jld_expand_property_iri( key, active_ctx );
 		next if starts_with( predicate_iri, "@" ) or predicate_iri eq "";
+		if ( termdef != null and termdef.get("reverse") ) {
+			for ( let item in _jld_array(_jld_get( value, key )) ) {
+				let object := _jld_object_term( item, active_ctx, state, graph, termdef );
+				_jld_add( state, object, rdf_iri(predicate_iri), subject, graph );
+			}
+			next;
+		}
 		_jld_add_values(
 			state,
 			subject,
@@ -494,9 +751,11 @@ function _jld_node ( value, Dict ctx, Dict state, graph ) {
 function _jsonld_options ( PairList options ) {
 	let out := {
 		base: "",
+		content_type: "",
 		into: null,
 		document_loader: null,
 		expand_context: null,
+		extract_all_scripts: false,
 		processing_mode: "json-ld-1.1",
 		produce_generalized_rdf: false,
 		rdf_direction: null,
@@ -517,13 +776,2304 @@ function jsonld_to_rdf ( data, ... PairList options ) {
 	let opts := _jsonld_options(options);
 	let ctx := _jld_context();
 	ctx{base} := "" _ opts{base};
+	ctx{document_loader} := opts{document_loader};
 	if ( opts{expand_context} != null ) {
 		let expanded_ctx := _jld_apply_context( ctx, opts{expand_context} );
 		ctx := expanded_ctx;
 	}
-	let state := _jld_state();
+	let state := _jld_state( opts{use_jcs} );
 	_jld_node( data, ctx, state, rdf_default_graph() );
-	return _parser_result( rdf_quads_unique(state{quads}), options );
+	let quads := rdf_quads_unique(state{quads});
+	if ( opts{into} != null ) {
+		opts{into}.add_quads(quads);
+		return opts{into};
+	}
+	return quads;
+}
+
+function _jsonld_api_options ( Dict raw? ) {
+	let source := raw == null ? {} : raw;
+	return {
+		base: source.exists("base") ? "" _ source{base} : "",
+		compact_arrays: source.exists("compact_arrays") ?
+			source{compact_arrays} :
+			true,
+		expand_context: source.exists("expand_context") ?
+			source{expand_context} :
+			null,
+		document_loader: source.exists("document_loader") ?
+			source{document_loader} :
+			null,
+		processing_mode: source.exists("processing_mode") ?
+			source{processing_mode} :
+			(source.exists("spec_version") and source{spec_version} eq "json-ld-1.0" ?
+				"json-ld-1.0" :
+				"json-ld-1.1"),
+		spec_version: source.exists("spec_version") ?
+			source{spec_version} :
+			"",
+	};
+}
+
+function _jld_context_from_api ( Dict opts ) {
+	let ctx := _jld_context();
+	ctx{base} := opts{base};
+	ctx{document_loader} := opts{document_loader};
+	if ( opts{expand_context} != null ) {
+		ctx := _jld_apply_context( ctx, opts{expand_context} );
+	}
+	return ctx;
+}
+
+function _jld_expanded_value ( value, Dict ctx, termdef ) {
+	if ( termdef != null and termdef.get("type") eq "@json" ) {
+		return {
+			"@value": value,
+			"@type": "@json",
+		};
+	}
+	if ( _jld_is_map(value) ) {
+		if ( _jld_keyword_has( value, ctx, "@value" ) ) {
+			let raw := _jld_keyword_get( value, ctx, "@value", null );
+			return null if raw == null;
+			let out := { "@value": raw };
+			if ( _jld_keyword_has( value, ctx, "@language" ) ) {
+				out.set( "@language", lc("" _ _jld_keyword_get(
+					value,
+					ctx,
+					"@language",
+				)) );
+			}
+			if ( _jld_keyword_has( value, ctx, "@type" ) ) {
+				out.set( "@type", _jld_expand_iri(
+					"" _ _jld_keyword_get( value, ctx, "@type" ),
+					ctx,
+					true,
+					true,
+				));
+			}
+			return out;
+		}
+		if ( _jld_keyword_has( value, ctx, "@id" ) and
+			_jld_keys(value).length() == 1 ) {
+			return {
+				"@id": _jld_expand_iri(
+					"" _ _jld_keyword_get( value, ctx, "@id" ),
+					ctx,
+					false,
+					true,
+				),
+			};
+		}
+	}
+	if ( termdef != null and termdef.get("type") eq "@id" ) {
+		return {
+			"@id": _jld_expand_iri( "" _ value, ctx, false, true ),
+		};
+	}
+	if ( termdef != null and termdef.get("type") eq "@vocab" ) {
+		return {
+			"@id": _jld_expand_iri( "" _ value, ctx, true, true ),
+		};
+	}
+	let out := { "@value": value };
+	if ( termdef != null and termdef.get("type") != null ) {
+		out.set( "@type", termdef.get("type") );
+	}
+	else if ( typeof value == "String" ) {
+		if ( termdef != null and termdef.get("language") != null and
+			termdef.get("language") ne "" ) {
+			out.set( "@language", lc("" _ termdef.get("language")) );
+		}
+		else if ( ctx{language} ne "" ) {
+			out.set( "@language", ctx{language} );
+		}
+	}
+	return out;
+}
+
+function _jld_has_non_keyword_member ( obj, Dict ctx ) {
+	for ( let key in _jld_keys(obj) ) {
+		next if key eq "@context";
+		return true unless starts_with( _jld_keyword( ctx, key ), "@" );
+	}
+	return false;
+}
+
+function _jld_preserve_empty_expansion ( value, Dict ctx, container ) {
+	return true if container eq "@list" or container eq "@set";
+	return true if value instanceof Array;
+	return false unless _jld_is_map(value);
+	return true if _jld_keyword_has( value, ctx, "@list" );
+	return true if _jld_keyword_has( value, ctx, "@set" );
+	return false;
+}
+
+function _jld_expand_array ( Array values, Dict ctx, termdef ) {
+	let out := [];
+	for ( let item in values ) {
+		let expanded := _jld_expand_element( item, ctx, termdef, false );
+		next if expanded == null;
+		if ( expanded instanceof Array ) {
+			for ( let nested in expanded ) {
+				out.push(nested) if nested != null;
+			}
+		}
+		else {
+			out.push(expanded);
+		}
+	}
+	return out;
+}
+
+function _jld_expand_list ( value, Dict ctx, termdef ) {
+	let raw := value instanceof Array ? value : [ value ];
+	let items := [];
+	for ( let item in raw ) {
+		let expanded := _jld_expand_element( item, ctx, termdef, false );
+		next if expanded == null;
+		if ( expanded instanceof Array ) {
+			for ( let nested in expanded ) {
+				items.push(nested) if nested != null;
+			}
+		}
+		else {
+			items.push(expanded);
+		}
+	}
+	return { "@list": items };
+}
+
+function _jld_expand_element ( element, Dict ctx, termdef, Boolean top_level ) {
+	return null if element == null;
+	if ( element instanceof Array ) {
+		return _jld_expand_array( element, ctx, termdef );
+	}
+	if ( not _jld_is_map(element) ) {
+		return top_level ? null : _jld_expanded_value( element, ctx, termdef );
+	}
+	let active_ctx := ctx;
+	if ( _jld_has( element, "@context" ) ) {
+		active_ctx := _jld_apply_context( ctx, _jld_get( element, "@context" ) );
+	}
+	if ( termdef != null and termdef.get("type") eq "@json" ) {
+		return _jld_expanded_value( element, active_ctx, termdef );
+	}
+	if ( _jld_keyword_has( element, active_ctx, "@value" ) ) {
+		return _jld_expanded_value( element, active_ctx, termdef );
+	}
+	if ( _jld_keyword_has( element, active_ctx, "@list" ) and
+		_jld_keys(element).length() <= 2 ) {
+		return _jld_expand_list(
+			_jld_keyword_get( element, active_ctx, "@list" ),
+			active_ctx,
+			termdef,
+		);
+	}
+	if ( _jld_keyword_has( element, active_ctx, "@set" ) and
+		_jld_keys(element).length() <= 2 ) {
+		return _jld_expand_array(
+			_jld_array(_jld_keyword_get( element, active_ctx, "@set", [] )),
+			active_ctx,
+			termdef,
+		);
+	}
+	let out := {};
+	for ( let key in _jld_keys(element) ) {
+		next if key eq "@context";
+		let value := _jld_get( element, key );
+		next if value == null;
+		let keyword := _jld_keyword( active_ctx, key );
+		if ( keyword eq "@id" ) {
+			out.set( "@id", _jld_expand_iri( "" _ value, active_ctx, false, true ) );
+		}
+		else if ( keyword eq "@type" ) {
+			let types := [];
+			for ( let item in _jld_array(value) ) {
+				types.push(_jld_expand_iri( "" _ item, active_ctx, true, true ));
+			}
+			out.set( "@type", types );
+		}
+		else if ( keyword eq "@graph" ) {
+			let expanded := _jld_expand_element( value, active_ctx, null, false );
+			out.set( "@graph", expanded instanceof Array ? expanded : [ expanded ] );
+		}
+		else if ( keyword eq "@included" ) {
+			let expanded := _jld_expand_element( value, active_ctx, null, false );
+			out.set( "@included", expanded instanceof Array ? expanded : [ expanded ] );
+		}
+		else if ( keyword eq "@reverse" ) {
+			let expanded := _jld_expand_element( value, active_ctx, null, false );
+			out.set( "@reverse", expanded );
+		}
+		else {
+			let expanded_key := _jld_expand_property_iri( key, active_ctx );
+			next unless starts_with( expanded_key, "http://" ) or
+				starts_with( expanded_key, "https://" ) or
+				_jld_abs_iri(expanded_key);
+			let terms := active_ctx{terms};
+			let prop_termdef := terms.exists(key) ? terms.get(key) : null;
+			if ( prop_termdef == null ) {
+				for ( let term_key in terms.keys() ) {
+					if ( terms.get(term_key).get("id") eq expanded_key ) {
+						prop_termdef := terms.get(term_key);
+					}
+				}
+			}
+			let value_ctx := active_ctx;
+			if ( prop_termdef != null and prop_termdef.get("context") != null ) {
+				value_ctx := _jld_apply_context(
+					value_ctx,
+					prop_termdef.get("context"),
+				);
+			}
+			let container := prop_termdef == null ? null : prop_termdef.get("container");
+			let list_value := value;
+			if ( container eq "@list" and _jld_is_map(value) and
+				_jld_keyword_has( value, value_ctx, "@list" ) ) {
+				list_value := _jld_keyword_get( value, value_ctx, "@list" );
+			}
+			let expanded_value := container eq "@list" ?
+				[ _jld_expand_list( list_value, value_ctx, prop_termdef ) ] :
+				_jld_expand_array( _jld_array(value), value_ctx, prop_termdef );
+			next if expanded_value.length() == 0 and
+				not _jld_preserve_empty_expansion( value, active_ctx, container );
+			if ( prop_termdef != null and prop_termdef.get("reverse") ) {
+				let reverse := out.exists("@reverse") ? out.get("@reverse") : {};
+				let existing := reverse.exists(expanded_key) ?
+					_jld_array(reverse.get(expanded_key)) :
+					[];
+				for ( let item in expanded_value ) {
+					existing.push(item);
+				}
+				reverse.set( expanded_key, existing );
+				out.set( "@reverse", reverse );
+			}
+			else {
+				out.set( expanded_key, expanded_value );
+			}
+		}
+	}
+	if ( top_level and out.keys().length() == 1 and out.exists("@id") ) {
+		return null;
+	}
+	if ( out.keys().length() == 0 ) {
+		return {} if not top_level and _jld_has_non_keyword_member( element, active_ctx );
+		return null;
+	}
+	return out;
+}
+
+function jsonld_expand ( data, Dict options? ) {
+	let opts := _jsonld_api_options(options);
+	let expanded := _jld_expand_element(
+		data,
+		_jld_context_from_api(opts),
+		null,
+		true,
+	);
+	return [] if expanded == null;
+	return expanded if expanded instanceof Array;
+	return expanded{"@graph"} if expanded.keys().length() == 1 and
+		expanded.exists("@graph");
+	return [ expanded ];
+}
+
+function _jld_inverse_context ( Dict ctx ) {
+	let terms := {};
+	let reverse_terms := {};
+	let containers := {};
+	let aliases := {};
+	for ( let key in (ctx{terms}).keys() ) {
+		let term := (ctx{terms}).get(key);
+		let id := term.get("id");
+		if ( starts_with( id, "@" ) ) {
+			aliases.set( id, key );
+		}
+		else if ( term.get("reverse") and id ne "" and
+			not reverse_terms.exists(id) ) {
+			reverse_terms.set( id, key );
+		}
+		else if ( id ne "" and not terms.exists(id) ) {
+			terms.set( id, key );
+			containers.set( id, term.get("container") );
+		}
+	}
+	return {
+		terms: terms,
+		reverse_terms: reverse_terms,
+		containers: containers,
+		aliases: aliases,
+	};
+}
+
+function _jld_compact_iri ( String iri, Dict ctx, Dict inverse ) {
+	let terms := inverse{terms};
+	return terms.get(iri) if terms.exists(iri);
+	for ( let key in (ctx{terms}).keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let term := (ctx{terms}).get(key);
+		next if term.get("reverse");
+		let id := term.get("id");
+		if ( id ne "" and not starts_with( id, "@" ) and starts_with( iri, id ) ) {
+			return key _ ":" _ substr( iri, length id );
+		}
+	}
+	if ( ctx{vocab} ne "" and starts_with( iri, ctx{vocab} ) ) {
+		return substr( iri, length ctx{vocab} );
+	}
+	return iri;
+}
+
+function _jld_compact_iri_prefix ( String iri, Dict ctx ) {
+	for ( let key in (ctx{terms}).keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let term := (ctx{terms}).get(key);
+		next if term.get("reverse");
+		let id := term.get("id");
+		next if iri eq id;
+		if ( id ne "" and not starts_with( id, "@" ) and
+			starts_with( iri, id ) ) {
+			let compact := key _ ":" _ substr( iri, length id );
+			return compact unless (ctx{terms}).exists(compact);
+		}
+	}
+	if ( ctx{vocab} ne "" and starts_with( iri, ctx{vocab} ) ) {
+		return substr( iri, length ctx{vocab} );
+	}
+	return iri;
+}
+
+function _jld_compact_id_iri ( String iri, Dict ctx ) {
+	for ( let key in (ctx{terms}).keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let term := (ctx{terms}).get(key);
+		next if term.get("reverse");
+		let id := term.get("id");
+		next if iri eq id;
+		if ( id ne "" and not starts_with( id, "@" ) and
+			starts_with( iri, id ) ) {
+			let compact := key _ ":" _ substr( iri, length id );
+			return compact unless (ctx{terms}).exists(compact);
+		}
+	}
+	if ( ctx{base} ne "" and starts_with( iri, ctx{base} ) ) {
+		return substr( iri, length ctx{base} );
+	}
+	if ( ctx{base} ne "" and contains( ctx{base}, "/" ) ) {
+		let parts := split( ctx{base}, "/", -1 );
+		parts.pop();
+		let dir := join( "/", parts ) _ "/";
+		if ( starts_with( iri, dir ) ) {
+			return substr( iri, length dir );
+		}
+	}
+	return iri;
+}
+
+function _jld_term_for_key ( Dict ctx, String key ) {
+	let terms := ctx{terms};
+	return terms.get(key) if terms.exists(key);
+	return null;
+}
+
+function _jld_term_matches_value ( term, value ) {
+	return false if term == null;
+	let container := term.get("container");
+	if ( _jld_is_map(value) and _jld_has( value, "@list" ) ) {
+		return container eq "@list";
+	}
+	let term_type := term.get("type");
+	if ( _jld_is_map(value) and _jld_has( value, "@id" ) and
+		_jld_keys(value).length() == 1 ) {
+		return true;
+	}
+	if ( not _jld_is_map(value) or not _jld_has( value, "@value" ) ) {
+		return true;
+	}
+	if ( _jld_has( value, "@type" ) ) {
+		return true if term_type == null and (
+			term.get("language") == null or term.get("language") eq ""
+		);
+		return term_type != null and term_type eq _jld_get( value, "@type" );
+	}
+	if ( _jld_has( value, "@language" ) ) {
+		let language := lc("" _ _jld_get( value, "@language" ));
+		return true if term_type == null and (
+			term.get("language") == null or term.get("language") eq ""
+		);
+		return term.get("language") != null and
+			term.get("language") ne "" and
+			lc("" _ term.get("language")) eq language;
+	}
+	return term_type == null and (
+		term.get("language") == null or term.get("language") eq ""
+	);
+}
+
+function _jld_compact_key_for_value (
+	String iri,
+	value,
+	Dict ctx,
+	Dict inverse
+) {
+	let match_iri := _jld_expand_iri( iri, ctx, true, false );
+	for ( let key in (ctx{terms}).keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let term := (ctx{terms}).get(key);
+		next if term.get("reverse");
+		next unless term.get("id") eq match_iri;
+		return key if _jld_term_matches_value( term, value );
+	}
+	let terms := inverse{terms};
+	if ( terms.exists(match_iri) ) {
+		let key := terms.get(match_iri);
+		return key if _jld_term_matches_value( _jld_term_for_key( ctx, key ), value );
+	}
+	return _jld_compact_iri_prefix( match_iri, ctx );
+}
+
+function _jld_compact_reverse_key_for_value (
+	String iri,
+	value,
+	Dict ctx,
+	Dict inverse
+) {
+	for ( let key in (ctx{terms}).keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let term := (ctx{terms}).get(key);
+		next unless term.get("reverse");
+		next unless term.get("id") eq iri;
+		return key if _jld_term_matches_value( term, value );
+	}
+	let terms := inverse{reverse_terms};
+	if ( terms.exists(iri) ) {
+		let key := terms.get(iri);
+		return key if _jld_term_matches_value( _jld_term_for_key( ctx, key ), value );
+	}
+	return _jld_compact_iri_prefix( iri, ctx );
+}
+
+function _jld_term_coerces_value ( term, value ) {
+	return false if term == null;
+	return false unless _jld_is_map(value) and _jld_has( value, "@value" );
+	let term_type := term.get("type");
+	if ( _jld_has( value, "@type" ) ) {
+		return term_type != null and term_type eq _jld_get( value, "@type" );
+	}
+	if ( _jld_has( value, "@language" ) ) {
+		let language := lc("" _ _jld_get( value, "@language" ));
+		return term.get("language") != null and
+			term.get("language") ne "" and
+			lc("" _ term.get("language")) eq language;
+	}
+	return term_type == null and (
+		term.get("language") == null or term.get("language") eq ""
+	);
+}
+
+function _jld_alias ( String keyword, Dict inverse ) {
+	let aliases := inverse{aliases};
+	return aliases.exists(keyword) ? aliases.get(keyword) : keyword;
+}
+
+function _jld_compact_one_or_many ( Array values, Dict opts ) {
+	if ( opts{compact_arrays} and values.length() == 1 ) {
+		return values[0];
+	}
+	return values;
+}
+
+function _jld_context_value_empty ( value ) {
+	if ( value == null ) {
+		return true;
+	}
+	if ( value instanceof Array ) {
+		return value.length() == 0;
+	}
+	return _jld_is_map(value) and _jld_keys(value).length() == 0;
+}
+
+function _jld_compact_value ( value, Dict ctx, Dict inverse, Dict opts, String prop := "" ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_compact_value( item, ctx, inverse, opts, prop ));
+		}
+		return _jld_compact_one_or_many( out, opts );
+	}
+	if ( not _jld_is_map(value) ) {
+		return value;
+	}
+	if ( _jld_has( value, "@value" ) ) {
+		let raw := _jld_get( value, "@value" );
+		let keys := _jld_keys(value);
+		let term := _jld_term_for_key( ctx, prop );
+		if ( _jld_term_coerces_value( term, value ) ) {
+			return raw;
+		}
+		if ( keys.length() == 1 ) {
+			return raw;
+		}
+		let out := {};
+		out.set( _jld_alias( "@value", inverse ), raw );
+		if ( _jld_has( value, "@type" ) ) {
+			out.set(
+				_jld_alias( "@type", inverse ),
+				_jld_compact_iri( "" _ _jld_get( value, "@type" ), ctx, inverse ),
+			);
+		}
+		if ( _jld_has( value, "@language" ) ) {
+			out.set( _jld_alias( "@language", inverse ), _jld_get( value, "@language" ) );
+		}
+		return out;
+	}
+	if ( _jld_has( value, "@id" ) and _jld_keys(value).length() == 1 ) {
+		let term := _jld_term_for_key( ctx, prop );
+		if ( term != null and (
+			term.get("type") eq "@id" or term.get("type") eq "@vocab"
+		) ) {
+			return _jld_compact_id_iri( "" _ _jld_get( value, "@id" ), ctx );
+		}
+		let out := {};
+		out.set(
+			_jld_alias( "@id", inverse ),
+			_jld_compact_id_iri( "" _ _jld_get( value, "@id" ), ctx ),
+		);
+		return out;
+	}
+	if ( _jld_has( value, "@list" ) ) {
+		let term := _jld_term_for_key( ctx, prop );
+		if ( term != null and term.get("container") eq "@list" ) {
+			return _jld_compact_value(
+				_jld_get( value, "@list" ),
+				ctx,
+				inverse,
+				opts,
+				prop,
+			);
+		}
+		let out := {};
+		let list_values := [];
+		for ( let item in _jld_array(_jld_get( value, "@list" )) ) {
+			list_values.push(_jld_compact_value( item, ctx, inverse, opts, prop ));
+		}
+		out.set(
+			_jld_alias( "@list", inverse ),
+			list_values,
+		);
+		return out;
+	}
+	let out := {};
+	if ( _jld_has( value, "@id" ) ) {
+		out.set(
+			_jld_alias( "@id", inverse ),
+			_jld_compact_id_iri( "" _ _jld_get( value, "@id" ), ctx ),
+		);
+	}
+	if ( _jld_has( value, "@type" ) ) {
+		let types := [];
+		for ( let t in _jld_array(_jld_get( value, "@type" )) ) {
+			types.push(_jld_compact_iri( "" _ t, ctx, inverse ));
+		}
+		out.set( _jld_alias( "@type", inverse ), _jld_compact_one_or_many( types, opts ) );
+	}
+	if ( _jld_has( value, "@graph" ) ) {
+		let graph_values := [];
+		for ( let item in _jld_array(_jld_get( value, "@graph" )) ) {
+			graph_values.push(_jld_compact_value( item, ctx, inverse, opts ));
+		}
+		let graph_term := _jld_term_for_key( ctx, prop );
+		if ( graph_term != null and graph_term.get("container") eq "@graph" ) {
+			return _jld_compact_one_or_many( graph_values, opts );
+		}
+		out.set(
+			_jld_alias( "@graph", inverse ),
+			prop eq "" ? graph_values : _jld_compact_one_or_many( graph_values, opts ),
+		);
+	}
+	if ( _jld_has( value, "@included" ) ) {
+		let included_values := [];
+		for ( let item in _jld_array(_jld_get( value, "@included" )) ) {
+			included_values.push(_jld_compact_value( item, ctx, inverse, opts ));
+		}
+		let included_key := _jld_alias( "@included", inverse );
+		let included_term := _jld_term_for_key( ctx, included_key );
+		out.set(
+			included_key,
+			included_term != null and included_term.get("container") eq "@set" ?
+				included_values :
+				_jld_compact_one_or_many( included_values, opts ),
+		);
+	}
+	if ( _jld_has( value, "@reverse" ) ) {
+		let reverse := _jld_get( value, "@reverse" );
+		let reverse_out := {};
+		for ( let key in _jld_keys(reverse).sort( fn ( a, b ) -> a cmp b ) ) {
+			let items := _jld_array(_jld_get( reverse, key ));
+			let compact_key := _jld_compact_reverse_key_for_value(
+				key,
+				items.length() > 0 ? items[0] : {},
+				ctx,
+				inverse,
+			);
+			let term := _jld_term_for_key( ctx, compact_key );
+			let values := [];
+			for ( let item in items ) {
+				values.push(_jld_compact_value(
+					item,
+					ctx,
+					inverse,
+					opts,
+					compact_key,
+				));
+			}
+			let compact_values := _jld_compact_one_or_many( values, opts );
+			if ( term != null and term.get("reverse") ) {
+				out.set( compact_key, compact_values );
+			}
+			else {
+				reverse_out.set( compact_key, compact_values );
+			}
+		}
+		out.set( _jld_alias( "@reverse", inverse ), reverse_out )
+			if _jld_keys(reverse_out).length() > 0;
+	}
+	let value_ctx := ctx;
+	let value_inverse := inverse;
+	if ( _jld_has( value, "@type" ) ) {
+		for ( let t in _jld_array(_jld_get( value, "@type" )) ) {
+			let type_key := _jld_compact_iri( "" _ t, ctx, inverse );
+			let type_term := _jld_term_for_key( ctx, type_key );
+			if ( type_term != null and type_term.get("context") != null ) {
+				value_ctx := _jld_apply_context( value_ctx, type_term.get("context") );
+				value_inverse := _jld_inverse_context(value_ctx);
+			}
+		}
+	}
+	for ( let key in _jld_keys(value).sort( fn ( a, b ) -> a cmp b ) ) {
+		next if starts_with( key, "@" );
+		let items := _jld_array(_jld_get( value, key ));
+		if ( items.length() == 0 ) {
+			out.set( _jld_compact_iri( key, value_ctx, value_inverse ), [] );
+			next;
+		}
+		for ( let item in items ) {
+			let compact_key := _jld_compact_key_for_value(
+				key,
+				item,
+				value_ctx,
+				value_inverse,
+			);
+			let term := _jld_term_for_key( value_ctx, compact_key );
+			let container := term == null ? null : term.get("container");
+			let values := out.exists(compact_key) ?
+				_jld_array(out.get(compact_key)) :
+				[];
+			if ( container eq "@list" and
+				_jld_is_map(item) and _jld_has( item, "@list" ) ) {
+				values.push(_jld_compact_value(
+					_jld_get( item, "@list" ),
+					value_ctx,
+					value_inverse,
+					opts,
+					compact_key,
+				));
+			}
+			else {
+				values.push(_jld_compact_value(
+					item,
+					value_ctx,
+					value_inverse,
+					opts,
+					compact_key,
+				));
+			}
+			out.set(
+				compact_key,
+				container eq "@set" ? values : _jld_compact_one_or_many( values, opts ),
+			);
+		}
+	}
+	return out;
+}
+
+function _jld_compact_expanded ( expanded, context_value, Dict opts ) {
+	let ctx := _jld_context_from_api(opts);
+	ctx := _jld_apply_context( ctx, context_value );
+	let inverse := _jld_inverse_context(ctx);
+	let compacted := _jld_compact_value( expanded, ctx, inverse, opts );
+	if ( compacted instanceof Array ) {
+		if ( compacted.length() == 0 ) {
+			compacted := {};
+		}
+		else if ( compacted.length() == 1 ) {
+			compacted := compacted[0];
+		}
+		else {
+			let graph_obj := {};
+			graph_obj.set( _jld_alias( "@graph", inverse ), compacted );
+			compacted := graph_obj;
+		}
+	}
+	if ( not _jld_is_map(compacted) ) {
+		let graph_obj := {};
+		graph_obj.set( _jld_alias( "@graph", inverse ), compacted );
+		compacted := graph_obj;
+	}
+	compacted.set( "@context", context_value )
+		unless _jld_context_value_empty(context_value);
+	return compacted;
+}
+
+function jsonld_compact ( data, context, Dict options? ) {
+	let opts := _jsonld_api_options(options);
+	let context_value := _jld_get( context, "@context", context );
+	let expanded := jsonld_expand(data, options);
+	return _jld_compact_expanded( expanded, context_value, opts );
+}
+
+function _jld_flatten_blank_id ( Dict state ) {
+	let id := "_:b" _ state{count};
+	state{count} := state{count} + 1;
+	return id;
+}
+
+function _jld_flatten_add_values ( Dict node, String key, Array values ) {
+	if ( not node.exists(key) ) {
+		node.set( key, values );
+		return null;
+	}
+	let existing := _jld_array(node.get(key));
+	for ( let item in values ) {
+		let seen := false;
+		for ( let old in existing ) {
+			seen := true if _jsonld_canonical(old) eq _jsonld_canonical(item);
+		}
+		next if seen;
+		existing.push(item);
+	}
+	node.set( key, existing );
+	return null;
+}
+
+function _jld_flatten_value ( value, Dict nodes, Dict state ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_flatten_value( item, nodes, state ));
+		}
+		return out;
+	}
+	return value unless _jld_is_map(value);
+	if ( _jld_has( value, "@value" ) ) {
+		return value;
+	}
+	if ( _jld_has( value, "@list" ) ) {
+		let list := {};
+		for ( let key in _jld_keys(value) ) {
+			if ( key eq "@list" ) {
+				list.set( "@list", _jld_flatten_value(
+					_jld_get( value, "@list" ),
+					nodes,
+					state,
+				) );
+			}
+			else {
+				list.set( key, _jld_get( value, key ) );
+			}
+		}
+		return list;
+	}
+	let id := _jld_has( value, "@id" ) ?
+		"" _ _jld_get( value, "@id" ) :
+		_jld_flatten_blank_id(state);
+	if ( not nodes.exists(id) ) {
+		nodes.set( id, { "@id": id } );
+	}
+	let node := nodes.get(id);
+	for ( let key in _jld_keys(value).sort( fn ( a, b ) -> a cmp b ) ) {
+		next if key eq "@id";
+		if ( key eq "@type" ) {
+			_jld_flatten_add_values( node, key, _jld_array(_jld_get( value, key )) );
+		}
+		else if ( key eq "@graph" ) {
+			if ( starts_with( id, "_:" ) ) {
+				let graph_nodes := {};
+				_jld_flatten_value( _jld_get( value, key ), graph_nodes, state );
+				let graph_values := [];
+				for ( let graph_id in graph_nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+					graph_values.push(graph_nodes.get(graph_id));
+				}
+				node.set( key, graph_values );
+			}
+			else {
+				node.set( key, _jld_flatten_value(
+					_jld_get( value, key ),
+					nodes,
+					state,
+				) );
+			}
+		}
+		else if ( key eq "@included" ) {
+			node.set( key, _jld_flatten_value( _jld_get( value, key ), nodes, state ) );
+		}
+		else if ( starts_with( key, "@" ) ) {
+			node.set( key, _jld_get( value, key ) );
+		}
+		else {
+			let values := [];
+			for ( let item in _jld_array(_jld_get( value, key )) ) {
+				values.push(_jld_flatten_value( item, nodes, state ));
+			}
+			_jld_flatten_add_values( node, key, values );
+		}
+	}
+	return { "@id": id };
+}
+
+function _jld_flatten_nodes ( value, Dict nodes, Dict state ) {
+	_jld_flatten_value( value, nodes, state );
+	return null;
+}
+
+function jsonld_flatten ( data, context := null, Dict options? ) {
+	let expanded := jsonld_expand( data, options );
+	let nodes := {};
+	let state := { count: 0 };
+	_jld_flatten_nodes( expanded, nodes, state );
+	let out := [];
+	for ( let id in nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let node := nodes.get(id);
+		out.push(node) unless node.keys().length() == 1 and node.exists("@id");
+	}
+	if ( context != null ) {
+		return jsonld_compact( out, context, options );
+	}
+	return out;
+}
+
+function _jld_frame_first ( value ) {
+	return value[0] if value instanceof Array and value.length() > 0;
+	return value;
+}
+
+function _jld_frame_pattern_matches ( value, pattern ) {
+	if ( pattern instanceof Array ) {
+		return true if pattern.length() == 0 and
+			not (value instanceof Array and value.length() > 0);
+		for ( let item in pattern ) {
+			return true if _jld_frame_pattern_matches( value, item );
+		}
+		return false;
+	}
+	return true if _jld_is_map(pattern) and _jld_keys(pattern).length() == 0;
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			return true if _jld_frame_pattern_matches( item, pattern );
+		}
+		return false;
+	}
+	return value == pattern;
+}
+
+function _jld_frame_value_matches ( value, frame, Dict nodes ) {
+	if ( frame instanceof Array ) {
+		return false if frame.length() == 0;
+		for ( let item in frame ) {
+			return true if _jld_frame_value_matches( value, item, nodes );
+		}
+		return false;
+	}
+	if ( _jld_is_map(frame) and _jld_has( frame, "@value" ) ) {
+		return false unless _jld_is_map(value) and _jld_has( value, "@value" );
+		return false unless _jld_frame_pattern_matches(
+			_jld_get( value, "@value" ),
+			_jld_get( frame, "@value" ),
+		);
+		if ( _jld_has( frame, "@type" ) ) {
+			let pattern := _jld_get( frame, "@type" );
+			return false if pattern instanceof Array and pattern.length() == 0 and
+				_jld_has( value, "@type" );
+			return false unless pattern instanceof Array and pattern.length() == 0 or
+				_jld_frame_pattern_matches( _jld_get( value, "@type" ), pattern );
+		}
+		else {
+			return false if _jld_has( value, "@type" );
+		}
+		if ( _jld_has( frame, "@language" ) ) {
+			let pattern := _jld_get( frame, "@language" );
+			return false if pattern instanceof Array and pattern.length() == 0 and
+				_jld_has( value, "@language" );
+			if ( not (pattern instanceof Array and pattern.length() == 0) ) {
+				let language := lc("" _ _jld_get( value, "@language" ));
+				let ok := false;
+				if ( pattern instanceof Array ) {
+					for ( let item in pattern ) {
+						ok := true if lc("" _ item) eq language;
+					}
+				}
+				else if ( _jld_is_map(pattern) ) {
+					ok := _jld_keys(pattern).length() == 0;
+				}
+				else {
+					ok := lc("" _ pattern) eq language;
+				}
+				return false unless ok;
+			}
+		}
+		else {
+			return false if _jld_has( value, "@language" );
+		}
+		return true;
+	}
+	if ( _jld_is_map(frame) and _jld_has( frame, "@list" ) ) {
+		return false unless _jld_is_map(value) and _jld_has( value, "@list" );
+		let patterns := _jld_array(_jld_get( frame, "@list" ));
+		return true if patterns.length() == 0;
+		for ( let item in _jld_array(_jld_get( value, "@list" )) ) {
+			for ( let pattern in patterns ) {
+				return true if _jld_frame_value_matches( item, pattern, nodes );
+			}
+		}
+		return false;
+	}
+	if ( _jld_is_map(frame) ) {
+		return true if _jld_keys(frame).length() == 0;
+		if ( _jld_is_map(value) and _jld_has( value, "@id" ) and
+			nodes.exists("" _ _jld_get( value, "@id" )) ) {
+			return _jld_frame_matches(
+				nodes.get("" _ _jld_get( value, "@id" )),
+				frame,
+				nodes,
+			);
+		}
+		return _jld_frame_matches( value, frame, nodes ) if _jld_is_map(value);
+		return false;
+	}
+	if ( _jld_is_map(value) and _jld_has( value, "@value" ) ) {
+		return _jld_get( value, "@value" ) == frame;
+	}
+	return value == frame;
+}
+
+function _jld_frame_matches ( node, frame, Dict nodes := {} ) {
+	return true unless _jld_is_map(frame);
+	let has_id_type := false;
+	if ( _jld_has( frame, "@id" ) ) {
+		has_id_type := true;
+		return false unless _jld_has( node, "@id" );
+		let wanted := _jld_array(_jld_get( frame, "@id" ));
+		let ok := false;
+		for ( let idobj in wanted ) {
+			ok := true if _jld_is_map(idobj) and _jld_keys(idobj).length() == 0;
+			if ( _jld_is_map(idobj) and _jld_get( idobj, "@id", "" ) eq
+				_jld_get( node, "@id", "" ) ) {
+				ok := true;
+			}
+		}
+		return false unless ok;
+	}
+	if ( _jld_has( frame, "@type" ) ) {
+		let type_frame := _jld_get( frame, "@type" );
+		if ( not (_jld_is_map(type_frame) and _jld_has( type_frame, "@default" )) ) {
+			has_id_type := true;
+			let wanted := _jld_array(type_frame);
+			if ( wanted.length() == 0 ) {
+				return false if _jld_has( node, "@type" );
+			}
+			else {
+				return false unless _jld_has( node, "@type" );
+				let have := _jld_array(_jld_get( node, "@type" ));
+				let ok := false;
+				for ( let type in wanted ) {
+					ok := true if _jld_is_map(type) and
+						_jld_keys(type).length() == 0;
+					ok := true if type in have;
+				}
+				return false unless ok;
+			}
+		}
+	}
+	let property_count := 0;
+	let matched_property := false;
+	let require_all := _jld_get( frame, "@requireAll", false ) ? true : false;
+	for ( let key in _jld_keys(frame) ) {
+		next if starts_with( key, "@" );
+		property_count++;
+		let value := _jld_get( frame, key );
+		let node_key := _jld_frame_equivalent_key( node, key );
+		if ( value instanceof Array and value.length() == 0 and
+			_jld_has( node, node_key ) ) {
+			return false;
+		}
+		if ( not _jld_has( node, node_key ) ) {
+			return false if require_all and
+				not (_jld_is_map(value) and _jld_has( value, "@default" ));
+			next;
+		}
+		let ok := false;
+		for ( let item in _jld_array(_jld_get( node, node_key )) ) {
+			ok := true if _jld_frame_value_matches( item, value, nodes );
+		}
+		return false unless ok;
+		matched_property := true;
+	}
+	return false if property_count > 0 and not has_id_type and not matched_property;
+	return true;
+}
+
+function _jld_expand_frame ( value, Dict ctx ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_expand_frame( item, ctx ));
+		}
+		return out;
+	}
+	return value unless _jld_is_map(value);
+	let active_ctx := ctx;
+	if ( _jld_has( value, "@context" ) ) {
+		active_ctx := _jld_apply_context( ctx, _jld_get( value, "@context" ) );
+	}
+	let out := {};
+	for ( let key in _jld_keys(value) ) {
+		next if key eq "@context";
+		let item := _jld_get( value, key );
+		let keyword := _jld_keyword( active_ctx, key );
+		if ( keyword eq "@type" ) {
+			if ( _jld_is_map(item) and _jld_has( item, "@default" ) ) {
+				out.set( "@type", {
+					"@default": _jld_expand_iri(
+						"" _ _jld_get( item, "@default" ),
+						active_ctx,
+						true,
+						true,
+					),
+				} );
+				next;
+			}
+			if ( _jld_is_map(item) and _jld_keys(item).length() == 0 ) {
+				out.set( "@type", [ {} ] );
+				next;
+			}
+			let types := [];
+			for ( let t in _jld_array(item) ) {
+				let expanded_type := _jld_expand_iri( "" _ t, active_ctx, true, true );
+				die "jsonld frame: @type must not include a blank node identifier"
+					if starts_with( expanded_type, "_:" );
+				types.push(expanded_type);
+			}
+			out.set( "@type", types );
+		}
+		else if ( keyword eq "@id" ) {
+			let ids := [];
+			for ( let id in _jld_array(item) ) {
+				if ( _jld_is_map(id) and _jld_keys(id).length() == 0 ) {
+					ids.push({});
+					next;
+				}
+				let expanded_id := _jld_expand_iri(
+					"" _ id,
+					active_ctx,
+					false,
+					true,
+				);
+				die "jsonld frame: @id must not include a blank node identifier"
+					if starts_with( expanded_id, "_:" );
+				ids.push({ "@id": expanded_id });
+			}
+			out.set( "@id", ids );
+		}
+		else if ( keyword eq "@reverse" ) {
+			let reverse := {};
+			for ( let rkey in _jld_keys(item) ) {
+				reverse.set(
+					_jld_expand_property_iri( rkey, active_ctx ),
+					_jld_expand_frame( _jld_get( item, rkey ), active_ctx ),
+				);
+			}
+			out.set( "@reverse", reverse );
+		}
+		else if ( keyword eq "@graph" ) {
+			out.set( "@graph", _jld_expand_frame( item, active_ctx ) );
+		}
+		else if ( keyword eq "@included" ) {
+			out.set( "@included", _jld_expand_frame( item, active_ctx ) );
+		}
+		else if ( keyword eq "@list" ) {
+			let list := [];
+			for ( let list_item in _jld_array(item) ) {
+				list.push(_jld_expand_frame( list_item, active_ctx ));
+			}
+			out.set( "@list", list );
+		}
+		else if ( keyword eq "@default" ) {
+			out.set(
+				"@default",
+				_jld_is_map(item) and _jld_keys(item).length() == 0 ?
+					{} :
+					_jld_expand_element( item, active_ctx, null, false ),
+			);
+		}
+		else if ( keyword eq "@embed" ) {
+			if ( item != true and item != false and
+				not ("" _ item in [ "@always", "@last", "@never", "@once" ]) ) {
+				die "jsonld frame: invalid @embed value";
+			}
+			out.set( "@embed", item );
+		}
+		else if ( starts_with( keyword, "@" ) ) {
+			out.set( keyword, item );
+		}
+		else {
+			let terms := active_ctx{terms};
+			let termdef := terms.exists(key) ? terms.get(key) : null;
+			let expanded_key := _jld_expand_property_iri( key, active_ctx );
+			if ( termdef != null and termdef.get("reverse") ) {
+				let reverse := out.exists("@reverse") ? out.get("@reverse") : {};
+				reverse.set( expanded_key, _jld_expand_frame( item, active_ctx ) );
+				out.set( "@reverse", reverse );
+			}
+			else {
+				let expanded_item := _jld_expand_frame( item, active_ctx );
+				if ( termdef != null and termdef.get("container") != null and
+					_jld_is_map(expanded_item) ) {
+					expanded_item.set( "@container", termdef.get("container") );
+				}
+				out.set( expanded_key, expanded_item );
+			}
+		}
+	}
+	return out;
+}
+
+function _jld_frame_stack_push ( Array stack, String id ) {
+	let out := [];
+	for ( let item in stack ) {
+		out.push(item);
+	}
+	out.push(id);
+	return out;
+}
+
+function _jld_frame_null_default ( value ) {
+	return true if typeof value == "String" and value eq "@null";
+	if ( _jld_is_map(value) and _jld_has( value, "@value" ) ) {
+		return true if _jld_get( value, "@value" ) eq "@null";
+	}
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			return false unless _jld_frame_null_default(item);
+		}
+		return true;
+	}
+	return false;
+}
+
+function _jld_frame_default_values ( frame ) {
+	if ( frame instanceof Array and frame.length() == 0 ) {
+		return [ { "@value": null } ];
+	}
+	return null if _jld_is_map(frame) and _jld_get( frame, "@omitDefault", false );
+	if ( _jld_is_map(frame) and _jld_has( frame, "@default" ) ) {
+		let raw := _jld_get( frame, "@default" );
+		return [] if raw instanceof Array and _jld_frame_null_default(raw);
+		return [ { "@value": null } ] if _jld_frame_null_default(raw);
+		return [ raw ] if _jld_is_map(raw) and _jld_keys(raw).length() == 0;
+		return [ raw ] if _jld_is_map(raw) and (
+			_jld_has( raw, "@value" ) or _jld_has( raw, "@id" ) or
+			_jld_has( raw, "@list" )
+		);
+		return [ { "@value": raw } ];
+	}
+	if ( _jld_is_map(frame) and _jld_has( frame, "@type" ) ) {
+		return [] if _jld_get( frame, "@container", "" ) eq "@set";
+		return [ { "@value": null } ];
+	}
+	return [ { "@value": null } ];
+}
+
+function _jld_frame_local_name ( String key ) {
+	let local := key;
+	let parts := split( local, "#", -1 );
+	local := parts[parts.length() - 1] if parts.length() > 1;
+	parts := split( local, "/", -1 );
+	local := parts[parts.length() - 1] if parts.length() > 1;
+	parts := split( local, ":", -1 );
+	local := parts[parts.length() - 1] if parts.length() > 1;
+	return local;
+}
+
+function _jld_frame_has_equivalent_key ( Dict out, String key ) {
+	return true if _jld_has( out, key );
+	let local := _jld_frame_local_name(key);
+	for ( let existing in _jld_keys(out) ) {
+		next if starts_with( existing, "@" );
+		return true if _jld_frame_local_name(existing) eq local;
+	}
+	return false;
+}
+
+function _jld_frame_has_non_keyword_key ( value ) {
+	return false unless _jld_is_map(value);
+	for ( let key in _jld_keys(value) ) {
+		return true unless starts_with( key, "@" );
+	}
+	return false;
+}
+
+function _jld_frame_equivalent_key ( Dict out, String key ) {
+	return key if _jld_has( out, key );
+	let local := _jld_frame_local_name(key);
+	for ( let existing in _jld_keys(out) ) {
+		next if starts_with( existing, "@" );
+		return existing if _jld_frame_local_name(existing) eq local;
+	}
+	return key;
+}
+
+function _jld_frame_embed_enabled ( frame ) {
+	let embed := _jld_get( frame, "@embed", true );
+	return false if embed == false;
+	return false if "" _ embed eq "@never";
+	return true;
+}
+
+function _jld_frame_embed_list_refs ( value, Dict nodes, Array stack, frame := null ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_frame_embed_list_refs( item, nodes, stack, frame ));
+		}
+		return out;
+	}
+	return value unless _jld_is_map(value);
+	if ( _jld_has( value, "@list" ) ) {
+		let out := {};
+		for ( let key in _jld_keys(value) ) {
+			if ( key eq "@list" ) {
+				let list_values := [];
+				let patterns := [];
+				if ( _jld_is_map(frame) and _jld_has( frame, "@list" ) ) {
+					patterns := _jld_array(_jld_get( frame, "@list" ));
+				}
+				for ( let item in _jld_array(_jld_get( value, key )) ) {
+					if ( patterns.length() > 0 and _jld_is_map(item) and
+						_jld_has( item, "@id" ) ) {
+						let matched := false;
+						for ( let pattern in patterns ) {
+							matched := true if _jld_frame_value_matches(
+								item,
+								pattern,
+								nodes,
+							);
+						}
+						next unless matched;
+					}
+					list_values.push(_jld_frame_embed_list_refs(
+						item,
+						nodes,
+						stack,
+						frame,
+					));
+				}
+				out.set(
+					key,
+					list_values,
+				);
+			}
+			else {
+				out.set( key, _jld_get( value, key ) );
+			}
+		}
+		return out;
+	}
+	if ( _jld_has( value, "@id" ) and
+		nodes.exists("" _ _jld_get( value, "@id" )) and
+		not (("" _ _jld_get( value, "@id" )) in stack) ) {
+		return _jld_frame_embed(
+			nodes.get("" _ _jld_get( value, "@id" )),
+			{},
+			nodes,
+			stack,
+		);
+	}
+	return value;
+}
+
+function _jld_frame_collect_id_refs ( value, Dict refs ) {
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			_jld_frame_collect_id_refs( item, refs );
+		}
+		return null;
+	}
+	return null unless _jld_is_map(value);
+	if ( _jld_has( value, "@id" ) ) {
+		let id := "" _ _jld_get( value, "@id" );
+		refs.set( id, refs.exists(id) ? refs.get(id) + 1 : 1 );
+	}
+	for ( let key in _jld_keys(value) ) {
+		_jld_frame_collect_id_refs( _jld_get( value, key ), refs )
+			unless key eq "@id";
+	}
+	return null;
+}
+
+function _jld_frame_collect_references ( value, Dict nodes ) {
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			_jld_frame_collect_references( item, nodes );
+		}
+		return null;
+	}
+	return null unless _jld_is_map(value);
+	if ( _jld_has( value, "@id" ) ) {
+		let id := "" _ _jld_get( value, "@id" );
+		nodes.set( id, { "@id": id } ) unless nodes.exists(id);
+	}
+	for ( let key in _jld_keys(value) ) {
+		_jld_frame_collect_references( _jld_get( value, key ), nodes )
+			unless key eq "@id";
+	}
+	return null;
+}
+
+function _jld_frame_collect_blank_ids ( value, Dict bnodes, Dict state ) {
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			_jld_frame_collect_blank_ids( item, bnodes, state );
+		}
+		return null;
+	}
+	return null unless _jld_is_map(value);
+	if ( _jld_has( value, "@id" ) ) {
+		let id := "" _ _jld_get( value, "@id" );
+		if ( starts_with( id, "_:" ) and not bnodes.exists(id) ) {
+			bnodes.set( id, "_:b" _ state{count} );
+			state{count} := state{count} + 1;
+		}
+	}
+	for ( let key in _jld_keys(value) ) {
+		_jld_frame_collect_blank_ids( _jld_get( value, key ), bnodes, state );
+	}
+	return null;
+}
+
+function _jld_frame_normalize_blank_ids ( value, Dict bnodes ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_frame_normalize_blank_ids( item, bnodes ));
+		}
+		return out;
+	}
+	return value unless _jld_is_map(value);
+	let out := {};
+	for ( let key in _jld_keys(value) ) {
+		let item := _jld_get( value, key );
+		if ( key eq "@id" and typeof item == "String" and bnodes.exists(item) ) {
+			out.set( key, bnodes.get(item) );
+		}
+		else if ( key eq "@type" and typeof item == "String" and
+			bnodes.exists(item) ) {
+			out.set( key, bnodes.get(item) );
+		}
+		else if ( key eq "@type" and item instanceof Array ) {
+			let types := [];
+			for ( let type in item ) {
+				types.push(
+					typeof type == "String" and bnodes.exists(type) ?
+						bnodes.get(type) :
+						type,
+				);
+			}
+			out.set( key, types );
+		}
+		else {
+			out.set( key, _jld_frame_normalize_blank_ids( item, bnodes ) );
+		}
+	}
+	return out;
+}
+
+function _jld_frame_blank_ref_counts ( value, Dict refs ) {
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			_jld_frame_blank_ref_counts( item, refs );
+		}
+		return null;
+	}
+	return null unless _jld_is_map(value);
+	for ( let key in _jld_keys(value) ) {
+		let item := _jld_get( value, key );
+		if ( (key eq "@id" or key eq "@type") and
+			typeof item == "String" and starts_with( item, "_:" ) ) {
+			refs.set( item, refs.exists(item) ? refs.get(item) + 1 : 1 );
+		}
+		else if ( key eq "@type" and item instanceof Array ) {
+			for ( let type in item ) {
+				if ( typeof type == "String" and starts_with( type, "_:" ) ) {
+					refs.set( type, refs.exists(type) ? refs.get(type) + 1 : 1 );
+				}
+			}
+		}
+		_jld_frame_blank_ref_counts( item, refs );
+	}
+	return null;
+}
+
+function _jld_frame_strip_blank_ids ( value, Dict refs ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_jld_frame_strip_blank_ids( item, refs ));
+		}
+		return out;
+	}
+	return value unless _jld_is_map(value);
+	let out := {};
+	for ( let key in _jld_keys(value) ) {
+		let item := _jld_get( value, key );
+		if ( (key eq "@id" or key eq "id") and
+			typeof item == "String" and starts_with( item, "_:" ) ) {
+			next if not refs.exists(item) or refs.get(item) <= 1;
+		}
+		out.set( key, _jld_frame_strip_blank_ids( item, refs ) );
+	}
+	return out;
+}
+
+function _jld_frame_finish ( value, Dict bnodes, Dict opts ) {
+	let out := _jld_frame_normalize_blank_ids( value, bnodes );
+	if ( opts{processing_mode} ne "json-ld-1.0" ) {
+		let refs := {};
+		_jld_frame_blank_ref_counts( out, refs );
+		out := _jld_frame_strip_blank_ids( out, refs );
+	}
+	return out;
+}
+
+function _jld_frame_embed (
+	node,
+	frame,
+	Dict nodes,
+	Array stack := [],
+	Boolean preserve_graph := false
+) {
+	if ( _jld_has( node, "@id" ) and ("" _ _jld_get( node, "@id" )) in stack ) {
+		return { "@id": "" _ _jld_get( node, "@id" ) };
+	}
+	let next_stack := _jld_has( node, "@id" ) ?
+		_jld_frame_stack_push( stack, "" _ _jld_get( node, "@id" ) ) :
+		stack;
+	let out := {};
+	let explicit := _jld_get( frame, "@explicit", false ) ? true : false;
+	let include_graph := preserve_graph or _jld_has( frame, "@graph" ) or
+		_jld_get( frame, "@container", "" ) eq "@graph";
+	let embed_mode := "" _ _jld_get( frame, "@embed", "" );
+	let ref_counts := {};
+	let embedded_once := {};
+	for ( let key in _jld_keys(node).sort( fn ( a, b ) -> a cmp b ) ) {
+		next if starts_with( key, "@" );
+		for ( let item in _jld_array(_jld_get( node, key )) ) {
+			if ( _jld_is_map(item) and _jld_has( item, "@id" ) ) {
+				let id := "" _ _jld_get( item, "@id" );
+				ref_counts.set(
+					id,
+					ref_counts.exists(id) ? ref_counts.get(id) + 1 : 1,
+				);
+			}
+		}
+	}
+	for ( let key in _jld_keys(node).sort( fn ( a, b ) -> a cmp b ) ) {
+		if ( starts_with( key, "@" ) ) {
+			if ( key eq "@graph" ) {
+				next unless include_graph;
+				let graph_frame := _jld_has( frame, "@graph" ) ?
+					_jld_frame_first(_jld_get( frame, "@graph" )) :
+					{};
+				let graph_nodes := {};
+				for ( let id in nodes.keys() ) {
+					graph_nodes.set( id, nodes.get(id) );
+				}
+				let graph_refs := {};
+				for ( let graph_item in _jld_array(_jld_get( node, key )) ) {
+					if ( _jld_is_map(graph_item) and
+						_jld_has( graph_item, "@id" ) ) {
+						let graph_id := "" _ _jld_get( graph_item, "@id" );
+						if ( _jld_keys(graph_item).length() > 1 or
+							not graph_nodes.exists(graph_id) ) {
+							graph_nodes.set( graph_id, graph_item );
+						}
+					}
+					for ( let graph_key in _jld_keys(graph_item) ) {
+						_jld_frame_collect_id_refs(
+							_jld_get( graph_item, graph_key ),
+							graph_refs,
+						) unless graph_key eq "@id";
+					}
+				}
+				let graph_values := [];
+				for ( let item in _jld_array(_jld_get( node, key )) ) {
+					if ( _jld_is_map(item) and _jld_has( item, "@id" ) and
+						graph_nodes.exists("" _ _jld_get( item, "@id" )) ) {
+						let item_id := "" _ _jld_get( item, "@id" );
+						next if _jld_is_map(graph_frame) and
+							_jld_keys(graph_frame).length() == 0 and
+							graph_refs.exists(item_id);
+						let graph_node := graph_nodes.get(item_id);
+						if ( _jld_keys(graph_node).length() == 1 and
+							_jld_keys(item).length() > 1 ) {
+							graph_node := item;
+						}
+						if ( _jld_frame_matches( graph_node, graph_frame, graph_nodes ) ) {
+							graph_values.push(_jld_frame_embed(
+								graph_node,
+								graph_frame,
+								graph_nodes,
+								next_stack,
+								include_graph,
+							));
+						}
+					}
+					else {
+						graph_values.push(item);
+					}
+				}
+				out.set( key, graph_values );
+				next;
+			}
+			out.set( key, _jld_get( node, key ) );
+			next;
+		}
+		next if explicit and not _jld_has( frame, key );
+		let values := [];
+		let prop_frame := _jld_has( frame, key ) ?
+			_jld_frame_first(_jld_get( frame, key )) :
+			null;
+		for ( let item in _jld_array(_jld_get( node, key )) ) {
+			next if prop_frame != null and
+				not _jld_frame_value_matches( item, prop_frame, nodes );
+			if ( _jld_is_map(item) and _jld_has( item, "@id" ) and
+				nodes.exists("" _ _jld_get( item, "@id" )) and
+				(
+					prop_frame == null or
+					_jld_frame_matches(
+						nodes.get("" _ _jld_get( item, "@id" )),
+						prop_frame,
+						nodes,
+					)
+				) ) {
+				if ( prop_frame == null and _jld_has( frame, "@included" ) ) {
+					let included_frame := _jld_frame_first(_jld_get(
+						frame,
+						"@included",
+					));
+					if ( _jld_frame_matches(
+						nodes.get("" _ _jld_get( item, "@id" )),
+						included_frame,
+						nodes,
+					) ) {
+						values.push(item);
+						next;
+					}
+				}
+				if ( prop_frame != null and
+					not _jld_frame_embed_enabled(prop_frame) ) {
+					values.push(item);
+					next;
+				}
+				if ( ("" _ _jld_get( item, "@id" )) in next_stack ) {
+					values.push(item);
+					next;
+				}
+				let item_id := "" _ _jld_get( item, "@id" );
+				if ( embed_mode eq "@last" ) {
+					ref_counts.set( item_id, ref_counts.get(item_id) - 1 );
+					if ( ref_counts.get(item_id) > 0 ) {
+						values.push(item);
+						next;
+					}
+				}
+				if ( embed_mode eq "@once" and embedded_once.exists(item_id) ) {
+					values.push(item);
+					next;
+				}
+				let embed_frame := prop_frame == null ? {} : prop_frame;
+				values.push(_jld_frame_embed(
+					nodes.get("" _ _jld_get( item, "@id" )),
+					embed_frame,
+					nodes,
+					next_stack,
+					include_graph,
+				));
+				embedded_once.set( item_id, true ) if embed_mode eq "@once";
+			}
+			else {
+				values.push(_jld_frame_embed_list_refs(
+					item,
+					nodes,
+					next_stack,
+					prop_frame,
+				));
+			}
+		}
+		out.set( key, values );
+	}
+	if ( _jld_has( frame, "@reverse" ) and _jld_has( node, "@id" ) ) {
+		let reverse_frame := _jld_get( frame, "@reverse" );
+		let reverse_out := {};
+		let node_id := "" _ _jld_get( node, "@id" );
+		for ( let key in _jld_keys(reverse_frame).sort( fn ( a, b ) -> a cmp b ) ) {
+			let prop_frame := _jld_frame_first(_jld_get( reverse_frame, key ));
+			let values := [];
+			for ( let id in nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+				let other := nodes.get(id);
+				next unless _jld_has( other, key );
+				for ( let item in _jld_array(_jld_get( other, key )) ) {
+					next unless _jld_is_map(item) and _jld_has( item, "@id" );
+					next unless "" _ _jld_get( item, "@id" ) eq node_id;
+					next unless _jld_frame_matches( other, prop_frame, nodes );
+					if ( not _jld_frame_embed_enabled(prop_frame) ) {
+						values.push({ "@id": id });
+					}
+					else if ( id in next_stack ) {
+						values.push({ "@id": id });
+					}
+					else {
+						values.push(_jld_frame_embed(
+							other,
+							prop_frame,
+							nodes,
+							next_stack,
+							include_graph,
+						));
+					}
+				}
+			}
+			reverse_out.set( key, values ) if values.length() > 0;
+		}
+		out.set( "@reverse", reverse_out ) if _jld_keys(reverse_out).length() > 0;
+	}
+	if ( _jld_has( frame, "@included" ) ) {
+		let included_frame := _jld_frame_first(_jld_get( frame, "@included" ));
+		let included_values := [];
+		let self_id := _jld_has( node, "@id" ) ? "" _ _jld_get( node, "@id" ) : "";
+		for ( let id in nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+			next if id eq self_id;
+			let other := nodes.get(id);
+			next unless _jld_frame_matches( other, included_frame, nodes );
+			included_values.push(_jld_frame_embed(
+				other,
+				included_frame,
+				nodes,
+				next_stack,
+				include_graph,
+			));
+		}
+		out.set( "@included", included_values ) if included_values.length() > 0;
+	}
+	if ( not _jld_has( out, "@type" ) and _jld_has( frame, "@type" ) ) {
+		let type_frame := _jld_get( frame, "@type" );
+		if ( _jld_is_map(type_frame) and _jld_has( type_frame, "@default" ) ) {
+			out.set( "@type", [ _jld_get( type_frame, "@default" ) ] );
+		}
+	}
+	for ( let key in _jld_keys(frame).sort( fn ( a, b ) -> a cmp b ) ) {
+		next if starts_with( key, "@" );
+		if ( not _jld_frame_has_equivalent_key( out, key ) ) {
+			let defaults := _jld_frame_default_values(_jld_frame_first(
+				_jld_get( frame, key ),
+			));
+			out.set( key, defaults ) if defaults != null;
+		}
+	}
+	return out;
+}
+
+function jsonld_frame ( data, frame, Dict options? ) {
+	let opts := _jsonld_api_options(options);
+	let context_value := _jld_get( frame, "@context", {} );
+	let bnodes := {};
+	_jld_frame_collect_blank_ids( data, bnodes, { count: 0 } );
+	let frame_ctx := _jld_context_from_api(opts);
+	let expanded_frame := _jld_expand_frame(frame, frame_ctx);
+	let frame_node := _jld_frame_first(_jld_array(expanded_frame));
+	if ( _jld_is_map(frame_node) and _jld_has( frame_node, "@graph" ) ) {
+		let graph_frame := _jld_frame_first(_jld_get( frame_node, "@graph" ));
+		if ( _jld_frame_has_non_keyword_key(graph_frame) ) {
+			frame_node := graph_frame;
+		}
+	}
+	let flattened := jsonld_flatten(data, null, options);
+	let nodes := {};
+	for ( let node in flattened ) {
+		nodes.set( "" _ _jld_get( node, "@id" ), node )
+			if _jld_has( node, "@id" );
+	}
+	_jld_frame_collect_references( flattened, nodes );
+	let framed := [];
+	for ( let id in nodes.keys().sort( fn ( a, b ) -> a cmp b ) ) {
+		let node := nodes.get(id);
+		if ( _jld_frame_matches( node, frame_node, nodes ) ) {
+			framed.push(_jld_frame_embed( node, frame_node, nodes ));
+		}
+	}
+	let compacted := _jld_compact_expanded( { "@graph": framed }, context_value, opts );
+	if ( framed.length() == 0 ) {
+		compacted.set( "@graph", [] );
+		return _jld_frame_finish( compacted, bnodes, opts );
+	}
+	if ( opts{processing_mode} ne "json-ld-1.0" and
+		_jld_is_map(compacted) and _jld_has( compacted, "@graph" ) ) {
+		let graph_values := _jld_array(_jld_get( compacted, "@graph" ));
+		if ( graph_values.length() == 1 and _jld_is_map(graph_values[0]) ) {
+			let out := {};
+			out.set( "@context", context_value )
+				unless _jld_context_value_empty(context_value);
+			for ( let key in _jld_keys(graph_values[0]) ) {
+				out.set( key, _jld_get( graph_values[0], key ) );
+			}
+			return _jld_frame_finish( out, bnodes, opts );
+		}
+	}
+	if ( _jld_is_map(compacted) and not _jld_has( compacted, "@graph" ) ) {
+		return _jld_frame_finish( compacted, bnodes, opts )
+			if opts{processing_mode} ne "json-ld-1.0";
+		let graph_item := {};
+		for ( let key in _jld_keys(compacted) ) {
+			graph_item.set( key, _jld_get( compacted, key ) )
+				unless key eq "@context";
+		}
+		let out := {};
+		out.set( "@context", context_value )
+			unless _jld_context_value_empty(context_value);
+		out.set( "@graph", [ graph_item ] );
+		return _jld_frame_finish( out, bnodes, opts );
+	}
+	return _jld_frame_finish( compacted, bnodes, opts );
+}
+
+const CBORLD_TAG := 51997;
+
+function _cborld_keywords () {
+	return {
+		"@context": 0,
+		"@type": 2,
+		"@id": 4,
+		"@value": 6,
+		"@direction": 8,
+		"@graph": 10,
+		"@included": 12,
+		"@index": 14,
+		"@json": 16,
+		"@language": 18,
+		"@list": 20,
+		"@nest": 22,
+		"@reverse": 24,
+		"@base": 26,
+		"@container": 28,
+		"@default": 30,
+		"@embed": 32,
+		"@explicit": 34,
+		"@none": 36,
+		"@omitDefault": 38,
+		"@prefix": 40,
+		"@preserve": 42,
+		"@protected": 44,
+		"@requireAll": 46,
+		"@set": 48,
+		"@version": 50,
+		"@vocab": 52,
+		"@propagate": 54,
+	};
+}
+
+function _cborld_empty_entry ( Number id ) {
+	return {
+		id: id,
+		compressionTable: [],
+	};
+}
+
+function _cborld_registry_entries ( raw ) {
+	let out := {
+		"0": _cborld_empty_entry(0),
+		"1": _cborld_empty_entry(1),
+	};
+	if ( raw == null ) {
+		return out;
+	}
+	if ( raw instanceof Array ) {
+		for ( let entry in raw ) {
+			out.set( "" _ _jld_get( entry, "id" ), entry );
+		}
+		return out;
+	}
+	if ( _jld_is_map(raw) ) {
+		for ( let key in _jld_keys(raw) ) {
+			out.set( "" _ key, _jld_get( raw, key ) );
+		}
+	}
+	return out;
+}
+
+function _cborld_table_maps ( entry ) {
+	let type_table := {};
+	let reverse_type_table := {};
+	if ( entry == null ) {
+		return {
+			type_table: type_table,
+			reverse_type_table: reverse_type_table,
+		};
+	}
+	for ( let spec in _jld_array(_jld_get( entry, "compressionTable", [] )) ) {
+		next unless _jld_is_map(spec);
+		let table_type := "" _ _jld_get( spec, "type", "none" );
+		let table := {};
+		let reverse := {};
+		let raw_table := _jld_get( spec, "table", {} );
+		for ( let key in _jld_keys(raw_table) ) {
+			let nkey := 0 + key;
+			let value := _jld_get( raw_table, key );
+			table.set( value, nkey );
+			reverse.set( "" _ nkey, value );
+		}
+		type_table.set( table_type, table );
+		reverse_type_table.set( table_type, reverse );
+	}
+	return {
+		type_table: type_table,
+		reverse_type_table: reverse_type_table,
+	};
+}
+
+function _cborld_state ( String strategy, entry := null ) {
+	let keywords := _cborld_keywords();
+	let term_to_id := {};
+	let id_to_term := {};
+	for ( let key in _jld_keys(keywords) ) {
+		let id := _jld_get( keywords, key );
+		term_to_id.set( key, id );
+		id_to_term.set( "" _ id, key );
+	}
+	let tables := _cborld_table_maps(entry);
+	return {
+		strategy: strategy,
+		nextTermId: 100,
+		termToId: term_to_id,
+		idToTerm: id_to_term,
+		typeTable: tables{type_table},
+		reverseTypeTable: tables{reverse_type_table},
+		contextCache: {},
+	};
+}
+
+function _cborld_option_dict ( PairList options ) {
+	let out := {
+		registry_entries: null,
+		registry_entry_id: 1,
+	};
+	for ( let pair in options.to_Array() ) {
+		if ( pair.key eq "registry_entries" ) {
+			out{registry_entries} := pair.value;
+		}
+		else if ( pair.key eq "registry_entry_id" ) {
+			out{registry_entry_id} := 0 + pair.value;
+		}
+	}
+	return out;
+}
+
+function _cborld_term_id ( Dict state, String term ) {
+	return _jld_get( state{termToId}, term, null );
+}
+
+function _cborld_register_term ( Dict state, String term ) {
+	return _cborld_term_id( state, term ) if _cborld_term_id( state, term ) != null;
+	let id := state{nextTermId};
+	state{nextTermId} := id + 2;
+	state{termToId}.set( term, id );
+	state{idToTerm}.set( "" _ id, term );
+	return id;
+}
+
+function _cborld_context_value ( value ) {
+	return _jld_get( value, "@context" ) if _jld_is_map(value) and
+		_jld_has( value, "@context" );
+	return value;
+}
+
+function _cborld_context_terms ( value ) {
+	let context := _cborld_context_value(value);
+	if ( context instanceof Array ) {
+		let out := [];
+		for ( let item in context ) {
+			for ( let term in _cborld_context_terms(item) ) {
+				out.push(term);
+			}
+		}
+		return out;
+	}
+	let out := [];
+	if ( _jld_is_map(context) ) {
+		for ( let term in _jld_keys(context).sort( fn ( a, b ) -> a cmp b ) ) {
+			next if starts_with( term, "@" );
+			out.push(term) if _jld_get( context, term ) != null;
+		}
+	}
+	return out;
+}
+
+function _cborld_load_context ( Dict state, value ) {
+	let key := _jsonld_canonical(value);
+	return null if state{contextCache}.exists(key);
+	state{contextCache}.set( key, true );
+	for ( let term in _cborld_context_terms(value) ) {
+		_cborld_register_term( state, term );
+	}
+	return null;
+}
+
+function _cborld_contexts_from_value ( value ) {
+	let out := [];
+	if ( value instanceof Array ) {
+		for ( let item in value ) {
+			for ( let ctx in _cborld_contexts_from_value(item) ) {
+				out.push(ctx);
+			}
+		}
+		return out;
+	}
+	if ( _jld_is_map(value) and _jld_has( value, "@context" ) ) {
+		out.push(_jld_get( value, "@context" ));
+	}
+	return out;
+}
+
+function _cborld_table_type ( String term, termdef, term_type := null ) {
+	return "context" if term eq "@context";
+	let is_url := false;
+	is_url := true if term eq "@id" or term eq "@type";
+	if ( _jld_is_map(termdef) ) {
+		let id := _jld_get( termdef, "@id", "" );
+		let type := _jld_get( termdef, "@type", "" );
+		is_url := true if id eq "@id" or id eq "@type";
+		is_url := true if type eq "@id" or type eq "@vocab";
+	}
+	is_url := true if term_type eq "@id" or term_type eq "@vocab";
+	return "url" if is_url;
+	return "" _ term_type if term_type != null;
+	return "none";
+}
+
+function _cborld_convert_for_compression (
+	Dict state,
+	String term,
+	termdef,
+	value,
+	term_type := null
+) {
+	return value if value instanceof Array or _jld_is_map(value);
+	let table_type := _cborld_table_type( term, termdef, term_type );
+	let tables := state{typeTable};
+	return value unless tables.exists(table_type);
+	let table := tables.get(table_type);
+	return table.get(value) if table.exists(value);
+	return value;
+}
+
+function _cborld_convert_for_decompression (
+	Dict state,
+	String term,
+	termdef,
+	value,
+	term_type := null
+) {
+	return value if value instanceof Array or _jld_is_map(value);
+	let table_type := _cborld_table_type( term, termdef, term_type );
+	let tables := state{reverseTypeTable};
+	return value unless tables.exists(table_type);
+	let table := tables.get(table_type);
+	return table.get("" _ value) if table.exists("" _ value);
+	die "cborld: unknown compressed table value " _ value
+		if value instanceof Number or (
+			typeof value == "String" and value ~ /^[0-9]+$/
+		);
+	return value;
+}
+
+function _cborld_compress_context_value ( value, Dict state ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_cborld_compress_context_value( item, state ));
+		}
+		return out;
+	}
+	if ( _jld_is_map(value) ) {
+		return value;
+	}
+	return _cborld_convert_for_compression(
+		state,
+		"@context",
+		{},
+		value,
+		null,
+	);
+}
+
+function _cborld_decompress_context_value ( value, Dict state ) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_cborld_decompress_context_value( item, state ));
+		}
+		return out;
+	}
+	if ( _jld_is_map(value) ) {
+		return value;
+	}
+	return _cborld_convert_for_decompression(
+		state,
+		"@context",
+		{},
+		value,
+		null,
+	);
+}
+
+function _cborld_context_termdef ( Dict active_context, String term ) {
+	return _jld_get( active_context, term, {} );
+}
+
+function _cborld_active_context_from_context ( Dict previous, context ) {
+	let out := {};
+	for ( let key in _jld_keys(previous) ) {
+		out.set( key, _jld_get( previous, key ) );
+	}
+	let raw := _cborld_context_value(context);
+	if ( raw instanceof Array ) {
+		for ( let item in raw ) {
+			out := _cborld_active_context_from_context( out, item );
+		}
+		return out;
+	}
+	if ( _jld_is_map(raw) ) {
+		for ( let term in _jld_keys(raw) ) {
+			out.set( term, _jld_get( raw, term ) ) unless starts_with( term, "@" );
+		}
+	}
+	return out;
+}
+
+function _cborld_compress_value (
+	value,
+	Dict state,
+	Dict active_context,
+	String term := "",
+	termdef := {}
+) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_cborld_compress_value(
+				item,
+				state,
+				active_context,
+				term,
+				termdef,
+			));
+		}
+		return out;
+	}
+	if ( not _jld_is_map(value) ) {
+		return _cborld_convert_for_compression(
+			state,
+			term,
+			termdef,
+			value,
+			_jld_is_map(termdef) ? _jld_get( termdef, "@type", null ) : null,
+		);
+	}
+	let output := {};
+	let local_context := active_context;
+	if ( _jld_has( value, "@context" ) ) {
+		let context_value := _jld_get( value, "@context" );
+		_cborld_load_context( state, context_value );
+		local_context := _cborld_active_context_from_context(
+			active_context,
+			context_value,
+		);
+		let compressed_context := _cborld_compress_context_value(
+			context_value,
+			state,
+		);
+		let context_id := _cborld_term_id( state, "@context" );
+		output.set(
+			context_value instanceof Array ? context_id + 1 : context_id,
+			compressed_context,
+		);
+	}
+	for ( let key in _jld_keys(value).sort( fn ( a, b ) -> a cmp b ) ) {
+		next if key eq "@context";
+		let item := _jld_get( value, key );
+		let id := _cborld_term_id( state, key );
+		let out_key := id == null ? key : id + (item instanceof Array ? 1 : 0);
+		let child_def := _cborld_context_termdef( local_context, key );
+		output.set( out_key, _cborld_compress_value(
+			item,
+			state,
+			local_context,
+			key,
+			child_def,
+		) );
+	}
+	return output;
+}
+
+function _cborld_decode_key ( Dict state, key ) {
+	let numeric_key := key instanceof Number ? key : null;
+	numeric_key := 0 + key if numeric_key == null and typeof key == "String" and
+		key ~ /^[0-9]+$/;
+	return { term: key, plural: false } unless numeric_key != null;
+	if ( state{idToTerm}.exists("" _ numeric_key) ) {
+		return { term: state{idToTerm}.get("" _ numeric_key), plural: false };
+	}
+	let singular := numeric_key - 1;
+	if ( state{idToTerm}.exists("" _ singular) ) {
+		return { term: state{idToTerm}.get("" _ singular), plural: true };
+	}
+	die "cborld: unknown compressed term id " _ key;
+}
+
+function _cborld_map_exists ( Dict map, key ) {
+	return true if map.exists(key);
+	return true if map.exists("" _ key);
+	return false;
+}
+
+function _cborld_map_get ( Dict map, key ) {
+	return map.get(key) if map.exists(key);
+	return map.get("" _ key);
+}
+
+function _cborld_decompress_value (
+	value,
+	Dict state,
+	Dict active_context,
+	String term := "",
+	termdef := {}
+) {
+	if ( value instanceof Array ) {
+		let out := [];
+		for ( let item in value ) {
+			out.push(_cborld_decompress_value(
+				item,
+				state,
+				active_context,
+				term,
+				termdef,
+			));
+		}
+		return out;
+	}
+	if ( not _jld_is_map(value) ) {
+		return _cborld_convert_for_decompression(
+			state,
+			term,
+			termdef,
+			value,
+			_jld_is_map(termdef) ? _jld_get( termdef, "@type", null ) : null,
+		);
+	}
+	let output := {};
+	let local_context := active_context;
+	let context_id := _cborld_term_id( state, "@context" );
+	let context_value := null;
+	let has_context := false;
+	if ( _cborld_map_exists( value, context_id ) ) {
+		context_value := _cborld_decompress_context_value(
+			_cborld_map_get( value, context_id ),
+			state,
+		);
+		has_context := true;
+	}
+	if ( _cborld_map_exists( value, context_id + 1 ) ) {
+		die "cborld: invalid encoded context"
+			if has_context or not (_cborld_map_get( value, context_id + 1 ) instanceof Array);
+		context_value := _cborld_decompress_context_value(
+			_cborld_map_get( value, context_id + 1 ),
+			state,
+		);
+		has_context := true;
+	}
+	if ( has_context ) {
+		output.set( "@context", context_value );
+		_cborld_load_context( state, context_value );
+		local_context := _cborld_active_context_from_context(
+			active_context,
+			context_value,
+		);
+	}
+	for ( let key in _jld_keys(value).sort( fn ( a, b ) -> ("" _ a) cmp ("" _ b) ) ) {
+		next if "" _ key eq "" _ context_id or "" _ key eq "" _ (context_id + 1);
+		let decoded := _cborld_decode_key( state, key );
+		let out_key := decoded{term};
+		let child_def := _cborld_context_termdef( local_context, out_key );
+		let item := _cborld_decompress_value(
+			value.get(key),
+			state,
+			local_context,
+			out_key,
+			child_def,
+		);
+		output.set( out_key, decoded{plural} and not (item instanceof Array) ?
+			[ item ] :
+			item );
+	}
+	return output;
+}
+
+function cborld_to_jsonld_data ( encoded, ... PairList options ) {
+	die "cborld: expected CBOR tag 51997" unless encoded instanceof TaggedValue and
+		encoded{tag} == CBORLD_TAG;
+	let payload := encoded{value};
+	die "cborld: invalid payload structure" unless payload instanceof Array and
+		payload.length() == 2 and payload[0] instanceof Number;
+	let registry_id := payload[0];
+	let registry_entries := _cborld_registry_entries(
+		_cborld_option_dict(options){registry_entries},
+	);
+	die "cborld: unknown registry entry " _ registry_id
+		unless registry_entries.exists("" _ registry_id);
+	if ( registry_id == 0 ) {
+		return payload[1];
+	}
+	let state := _cborld_state(
+		"decompression",
+		registry_entries.get("" _ registry_id),
+	);
+	return _cborld_decompress_value( payload[1], state, {} );
+}
+
+function jsonld_data_to_cborld ( data, ... PairList options ) {
+	let opts := _cborld_option_dict(options);
+	let registry_entries := _cborld_registry_entries(opts{registry_entries});
+	die "cborld: unknown registry entry " _ opts{registry_entry_id}
+		unless registry_entries.exists("" _ opts{registry_entry_id});
+	if ( opts{registry_entry_id} == 0 ) {
+		return new TaggedValue( tag: CBORLD_TAG, value: [ 0, data ] );
+	}
+	let state := _cborld_state(
+		"compression",
+		registry_entries.get("" _ opts{registry_entry_id}),
+	);
+	for ( let context_value in _cborld_contexts_from_value(data) ) {
+		_cborld_load_context( state, context_value );
+	}
+	let compressed := _cborld_compress_value( data, state, {} );
+	return new TaggedValue(
+		tag: CBORLD_TAG,
+		value: [ opts{registry_entry_id}, compressed ],
+	);
 }
 
 function _fromrdf_term_id ( term ) {
@@ -538,8 +3088,8 @@ function _fromrdf_value ( RDFLiteral term, Dict opts ) {
 		obj.set( "@language", term.get_lang() );
 	}
 	else if ( term.get_datatype().get_value() ne XSD_NS _ "string" ) {
+		let dt := term.get_datatype().get_value();
 		if ( opts{use_native_types} ) {
-			let dt := term.get_datatype().get_value();
 			if ( dt eq XSD_NS _ "boolean" and
 				lc(term.get_value()) in [ "true", "false" ] ) {
 				return lc(term.get_value()) eq "true";
@@ -548,7 +3098,13 @@ function _fromrdf_value ( RDFLiteral term, Dict opts ) {
 				return 0 + term.get_value();
 			}
 		}
-		obj.set( "@type", term.get_datatype().get_value() );
+		if ( dt eq RDF_NS _ "JSON" ) {
+			let parsed := _jld_json_decoder.decode( term.get_value() );
+			obj.set( "@value", parsed );
+			obj.set( "@type", "@json" );
+			return obj;
+		}
+		obj.set( "@type", dt );
 	}
 	return obj;
 }

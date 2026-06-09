@@ -4,15 +4,130 @@
 
 rdf/jsonld - JSON-LD parser and serializer facade.
 
+=head1 SYNOPSIS
+
+  from rdf/jsonld import
+      JsonLdParser,
+      JsonLdSerializer,
+      jsonld_expand,
+      jsonld_compact,
+      jsonld_flatten,
+      jsonld_frame,
+      jsonld_decode_text;
+
+  let expanded := jsonld_expand(data, { base: "https://example.test/" });
+  let compacted := jsonld_compact(expanded, {
+      "@context": { ex: "https://example.test/" },
+  });
+  let flattened := jsonld_flatten(data);
+
+=head1 DESCRIPTION
+
+This module re-exports the JSON-LD, YAML-LD, CBOR-LD, and compressed
+CBOR-LD RDF parser and serializer classes, plus the public JSON-LD API
+functions implemented by this distribution.
+
+The parser and serializer classes operate on RDF quads and compose the
+C<RdfParser> and C<RdfSerializer> traits from the main C<rdf>
+distribution. The JSON-LD API functions operate on decoded JSON-like
+ZuzuScript data structures.
+
+=head1 EXPORTS
+
+=head2 Classes
+
+=over
+
+=item C<JsonLdParser>, C<YamlLdParser>, C<CborLdParser>, C<CompressedCborLdParser>
+
+Parse JSON-LD, YAML-LD, plain CBOR-LD, or compressed CBOR-LD into RDF
+quads, or into a supplied RDF store via the C<into> option.
+
+=item C<JsonLdSerializer>, C<YamlLdSerializer>, C<CborLdSerializer>, C<CompressedCborLdSerializer>
+
+Serialize RDF quads as expanded JSON-LD data encoded as JSON, YAML, or
+CBOR. The compressed CBOR-LD serializer emits tagged CBOR-LD using
+registry entry 1 by default.
+
+=back
+
+=head2 Functions
+
+=over
+
+=item C<< jsonld_expand(data, options?) >>
+
+Expands a JSON-LD document into expanded JSON-LD form. Supported options
+include C<base>, C<compact_arrays>, C<expand_context>, and
+C<document_loader>. C<document_loader> may be a function taking a URL or
+an object with C<load_document(url)>; it should return either decoded
+JSON-LD data or a remote document dictionary with C<document>,
+C<document_url>, C<content_type>, and C<context_url> keys.
+
+=item C<< jsonld_decode_text(text, options...) >>
+
+Decodes JSON text, or extracts JSON-LD script elements from HTML when
+C<content_type> contains C<html> or the text looks like an HTML
+document. HTML extraction supports C<base> for fragment targeting and
+C<extract_all_scripts>.
+
+=item C<< jsonld_compact(data, context, options?) >>
+
+Expands C<data> and compacts it using C<context>. The result includes
+C<@context>.
+
+=item C<< jsonld_flatten(data, context?, options?) >>
+
+Expands and flattens C<data>. When C<context> is supplied, the flattened
+result is compacted using that context.
+
+=item C<< jsonld_frame(data, frame, options?) >>
+
+Expands, flattens, frames, and compacts C<data> using a JSON-LD frame.
+The implementation supports graph/type framing with nested node
+embedding and uses the frame C<@context> as the output context.
+
+=item C<jsonld_to_rdf>, C<rdf_to_jsonld_data>
+
+Lower-level ToRDF and FromRDF helpers used by the parser and serializer
+classes.
+
+=item C<cborld_to_jsonld_data>, C<jsonld_data_to_cborld>
+
+Lower-level helpers for converting between decoded JSON-LD data and
+tagged CBOR-LD values.
+
+=item C<jsonld_object_equals>
+
+Compares JSON-LD result objects in tests while ignoring object member
+ordering.
+
+=back
+
+=head1 COPYRIGHT AND LICENCE
+
+B<< rdf/jsonld >> is copyright Toby Inkster.
+
+It is free software; you may redistribute it and/or modify it under
+the terms of either the Artistic License 1.0 or the GNU General Public
+License version 2.
+
 =cut
 
 from rdf/parser/jsonld import JsonLdParser;
 from rdf/parser/yamlld import YamlLdParser;
-from rdf/parser/cborld import CborLdParser;
+from rdf/parser/cborld import CborLdParser, CompressedCborLdParser;
 from rdf/serializer/jsonld import JsonLdSerializer;
 from rdf/serializer/yamlld import YamlLdSerializer;
-from rdf/serializer/cborld import CborLdSerializer;
+from rdf/serializer/cborld import CborLdSerializer, CompressedCborLdSerializer;
 from rdf/jsonld/core import
+	cborld_to_jsonld_data,
+	jsonld_compact,
+	jsonld_data_to_cborld,
+	jsonld_decode_text,
+	jsonld_expand,
+	jsonld_flatten,
+	jsonld_frame,
 	jsonld_object_equals,
 	jsonld_to_rdf,
 	rdf_to_jsonld_data;
