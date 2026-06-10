@@ -1,8 +1,6 @@
 # JSON-LD Full API TODO
 
-This distribution initially targets JSON-LD 1.1 RDF parsing and
-serialization: ToRDF and FromRDF. The following remain future work:
-
+- [x] JSON-LD 1.1 RDF parsing and serialization: ToRDF and FromRDF. 
 - [x] Public compact, expand, and flatten API functions.
 - [x] Remote document loading over HTTP(S), including link headers,
   redirects, content-type handling, and remote context caching.

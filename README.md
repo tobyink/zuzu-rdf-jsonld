@@ -41,7 +41,3 @@ accept the same `base` and `into` options as the main RDF parsers.
 Serializers compose the `RdfSerializer` trait from `rdf/serializer` and
 support `serialize` and `serialize_each`.
 
-## Notes
-
-See `FULL-API-TODO.md` for JSON-LD API features outside this first RDF
-parser/serializer release.
